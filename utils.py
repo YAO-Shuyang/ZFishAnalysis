@@ -24,6 +24,7 @@ import os
 import matplotlib.pyplot as plt
 from os.path import join, exists
 from .swim import OPTO_POS
+from ._classes import SwimDataDict, LengthAlignedDict
 
 ChannelColors = ['#d56e9e', '#3c619a']
 
@@ -141,10 +142,10 @@ def Clear_Axes(
     return ax
 
 def SubDict(
-    data: dict,
+    data: LengthAlignedDict,
     idx: np.ndarray, 
     keys: Optional[str | list | KeysView] = 'all'
-):
+) -> LengthAlignedDict:
     """
     Return a subset of data. 
     
@@ -167,30 +168,45 @@ def SubDict(
     subdic: dict
         The subset of input dictionary.
     """
+    if isinstance(data, dict) and not isinstance(data, LengthAlignedDict):
+        data = LengthAlignedDict(data)
     
-    assert isinstance(data, dict), "data should be a dictionary!"
+    assert isinstance(data, LengthAlignedDict), "data should be a LengthAlignedDict!"
     assert isinstance(idx, np.ndarray), "idx should be a np.ndarray object!"
-
-    subdic = {}
-
-    if isinstance(keys, str):
-        if keys == 'all':
-            keys = data.keys()
-        else:
-            raise ValueError(
-                f"Only 'all' is valid when keys is str, but got {keys}"
-            )
-    else:
-        assert len(keys) != 0, "keys should not be an empty list!"
-        
-            
-    for k in keys:
-        try: 
-            subdic[k] = cp.deepcopy(data[k][idx])
-        except:
-            assert False
     
-    return subdic
+    return data.subdict(idx, dict_keys=keys)
+
+def MergeDicts(
+    dict1: LengthAlignedDict,
+    dict2: LengthAlignedDict,
+    keys: Optional[str | list | KeysView] = 'all'
+) -> LengthAlignedDict:
+    """
+    Merge two LengthAlignedDict objects by concatenating their values along 
+    the first axis.
+
+    Parameters
+    ----------
+    dict1: LengthAlignedDict
+        The first LengthAlignedDict to merge.
+    dict2: LengthAlignedDict
+        The second LengthAlignedDict to merge.
+
+    Returns
+    -------
+    LengthAlignedDict
+        A new LengthAlignedDict containing the merged data.
+    """
+    if isinstance(dict1, dict) and not isinstance(dict1, LengthAlignedDict):
+        dict1 = LengthAlignedDict(dict1)
+    if isinstance(dict2, dict) and not isinstance(dict2, LengthAlignedDict):
+        dict2 = LengthAlignedDict(dict2)
+    
+    return (
+        dict1.subdict(np.arange(dict1.shape[0]), dict_keys=keys) + 
+        dict2.subdict(np.arange(dict2.shape[0]), dict_keys=keys)
+    )
+
 
 def readout_paradigm(paradm_code: int) -> str:
     """
@@ -206,17 +222,34 @@ def readout_paradigm(paradm_code: int) -> str:
     str
         The name of the paradigm.
     """
+    if isinstance(paradm_code, SwimDataDict):
+        # the user incorrectly input the results of import16chFlt function
+        paradm_code = paradm_code['Paradigm'][0]
+    elif isinstance(paradm_code, np.ndarray):
+        # the user input the 'Paradigm' field of import16chFlt function result
+        # but forget to get the first element (because it is a 1-element array)
+        paradm_code = paradm_code[0]
+    elif isinstance(paradm_code, int) or isinstance(paradm_code, np.integer):
+        pass
+    else:
+        raise TypeError(
+            f'paradm_code should be int, dict or np.ndarray, but got '
+            f'{type(paradm_code)}'
+        )
+
     if paradm_code == 59595:
         return 'GoDarkGo'
     elif paradm_code == 20250916:
         return '1D Open-loop Navigation'
-    elif paradm_code == 20250921:
+    elif paradm_code == 20250921 or paradm_code == 20250920: 
+        # I don't know why some old results have paradm_code 20250920
         return '1D Close-loop Navigation'
     elif paradm_code == 20251102:
         return '2D Close-loop Open Field'
     elif paradm_code == 20251109:
         return '2D Set Offset'
-    elif paradm_code == 20251113:
+    elif paradm_code == 20251113 or paradm_code == 20251112: 
+        # In some old results, the paradigm code is 202511112'
         return '1D Close-loop Speed-coupled Optogenetics'
     elif paradm_code == 20251114:
         return 'Manual Optogenetics Pretest'

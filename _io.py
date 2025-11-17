@@ -10,11 +10,12 @@ and add some annotations for future learners.
 @Shuyang Yao
 """
 import numpy as np
+from ._classes import SwimDataDict
 
 class FileExtensionError(Exception):
     pass
 
-def import10ch(filename: str) -> dict:
+def import10ch(filename: str) -> SwimDataDict:
     """ 
     Imports *.10ch or *.10chFlt file and parses it into Excel-like
     data formats (Dictionary). Dictionary can be easily converted to
@@ -96,9 +97,10 @@ def import10ch(filename: str) -> dict:
         data['camTrigger'] = A[7, :]
         data['2pTrigger'] = A[8, :]
         data['temp'] = A[9, :]
+        data = SwimDataDict(data, extension='.10ch')
         
     elif filename.endswith('.10chFlt'):
-        data = {}   
+        data = {}
         # Create a Gaussian kernel for smoothing with sigma = 20
         ker = np.exp(-np.arange(-60, 61)**2 / (2 * 20**2.))
         ker /= np.sum(ker)
@@ -116,10 +118,11 @@ def import10ch(filename: str) -> dict:
         data['camTrigger'] = A[2, :]
         data['drift'] = A[6, :]
         data['gain'] = A[9, :]
+        data = SwimDataDict(data, extension='.10chFlt')
     
     return data
 
-def import12chFlt(filename: str) -> dict:
+def import12chFlt(filename: str) -> SwimDataDict:
     """
     Imports *.12chFlt file and parses it into Excel-like
     data formats (Dictionary). Dictionary can be easily converted to
@@ -158,8 +161,8 @@ def import12chFlt(filename: str) -> dict:
         )
     with open(filename, 'rb') as f:
         A = np.fromfile(f, np.float32).reshape((-1, 12)).T
-        
-    data = {}   
+
+    data = {}
     # Create a Gaussian kernel for smoothing with sigma = 20
     ker = np.exp(-np.arange(-60, 61)**2 / (2 * 20**2.))
     ker /= np.sum(ker)
@@ -184,10 +187,11 @@ def import12chFlt(filename: str) -> dict:
     data['pass_speed'] = A[9, :].astype(np.float64)
     data['active_gain'] = A[10, :].astype(np.float64)
     data['swim_speed'] = A[11, :].astype(np.float64)
+    data = SwimDataDict(data, extension='.12chFlt')
         
     return data
 
-def import16chFlt(filename: str) -> dict:
+def import16chFlt(filename: str) -> SwimDataDict:
     """
     Imports *.16chFlt file and parses it into Excel-like
     data formats (Dictionary). Dictionary can be easily converted to
@@ -209,15 +213,19 @@ def import16chFlt(filename: str) -> dict:
         - 'fltCh0': filtered channel 0 data
         - 'fltCh1': filtered channel 1 data
         - 'n_trials': number of trials
-        - 'behav_pos': behavioral position
+        - 'behav_pos_x': behavioral position x
+        - 'behav_pos_y': behavioral position y
         - 'in_trial_time': in-trial time
-        - 'behav_speed': behavioral speed
+        - 'behav_speed_x': behavioral speed x
+        - 'behav_speed_y': behavioral speed y
+        - 'behav_orient': behavioral orientation
         - 'opto_states': optogenetic states
         - 'Paradigm': paradigm type
         - 'Stim Type': stimulus type
         - 'pass_speed': passive speed
-        - 'active_gain': active gain
+        - 'swim_gain': active gain
         - 'swim_speed': swim speed
+        - 'turn_gain': turn gain
     """
     if not filename.endswith('.16chFlt'):
         raise FileExtensionError(
@@ -257,6 +265,7 @@ def import16chFlt(filename: str) -> dict:
     data['swim_gain'] = A[13, :].astype(np.float64)
     data['swim_speed'] = A[14, :].astype(np.float64)
     data['turn_gain'] = A[15, :].astype(np.float64)
+    data = SwimDataDict(data, extension='.16chFlt')
     
     return data
 
