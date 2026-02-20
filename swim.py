@@ -97,11 +97,15 @@ def calc_engagement_score(
             f" Got unique values: {np.unique(state)}."
         )
     
+    avg_signals = np.convolve(
+        avg_signals, np.ones(200)/200, mode='same'
+    )  # smooth the signal a bit
+    
     state0_idx = np.where(state == 0)[0]
     state1_idx = np.where(state == 1)[0]
     
-    mean_top_state0 = get_mean_top_values(avg_signals[state0_idx], v_percent)
-    mean_top_state1 = get_mean_top_values(avg_signals[state1_idx], v_percent)
+    mean_top_state0 = np.mean(avg_signals[state0_idx])
+    mean_top_state1 = np.mean(avg_signals[state1_idx])
     engagement_score = mean_top_state0 / (mean_top_state0 + mean_top_state1)
     
     engagement_shuf = np.zeros(n_shuffle)
@@ -110,8 +114,8 @@ def calc_engagement_score(
     for i in tqdm(range(n_shuffle)):
         state0_idx_shuf = (state0_idx + roll_shift[i]) % avg_signals.shape[0]
         state1_idx_shuf = (state1_idx + roll_shift[i]) % avg_signals.shape[0]
-        mean_top_shuf_state0 = get_mean_top_values(avg_signals[state0_idx_shuf], v_percent)
-        mean_top_shuf_state1 = get_mean_top_values(avg_signals[state1_idx_shuf], v_percent)
+        mean_top_shuf_state0 = np.mean(avg_signals[state0_idx_shuf])
+        mean_top_shuf_state1 = np.mean(avg_signals[state1_idx_shuf])
         engagement_shuf[i] = mean_top_shuf_state0 / (mean_top_shuf_state0 + mean_top_shuf_state1)
 
     p_value = np.mean(engagement_shuf >= engagement_score)
@@ -248,8 +252,8 @@ def event_based_realignment(
         
     n_bins = int((time_range[1] - time_range[0]) / bin_size)
     realigned_time = np.linspace(
-        time_range[0], time_range[1], n_bins
-    ) + bin_size / 2
+        time_range[0], time_range[1], n_bins+1
+    )[:-1] + bin_size / 2
 
     if is_shuffle:
         try:
@@ -289,8 +293,7 @@ def event_based_realignment(
                 
                 within_bin_mask = np.where(
                     (behav_time[time_mask] >= event_time + dt) &
-                    (behav_time[time_mask] < event_time + (dt + bin_size)) &
-                    (data['behav_speed_y'][time_mask] >= 0)
+                    (behav_time[time_mask] < event_time + (dt + bin_size))
                 )[0]
                 
                 for key_names in segmented_keys:

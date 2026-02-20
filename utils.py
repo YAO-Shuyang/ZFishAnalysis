@@ -27,6 +27,7 @@ from .swim import OPTO_POS
 from ._classes import SwimDataDict, LengthAlignedDict
 
 ChannelColors = ['#d56e9e', '#3c619a']
+LEDColor = '#a9dcf5'
 
 def mkdir(path: str) -> bool:
     """

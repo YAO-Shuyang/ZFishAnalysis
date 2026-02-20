@@ -191,7 +191,7 @@ def import12chFlt(filename: str) -> SwimDataDict:
         
     return data
 
-def import16chFlt(filename: str) -> SwimDataDict:
+def import16chFlt(filename: str, nchannel: int=21) -> SwimDataDict:
     """
     Imports *.16chFlt file and parses it into Excel-like
     data formats (Dictionary). Dictionary can be easily converted to
@@ -226,14 +226,26 @@ def import16chFlt(filename: str) -> SwimDataDict:
         - 'swim_gain': active gain
         - 'swim_speed': swim speed
         - 'turn_gain': turn gain
+        - 'led_power': LED power (if available)
+        - 'AI2': Green Camera signal (if available)
+        - 'AI3': Red Camera signal (if available)
+        - 'AI4': IR camera (if available)
+        - 'map': Map ID (if available)
     """
     if not filename.endswith('.16chFlt'):
         raise FileExtensionError(
             f"File must be of type .16chFlt, but got "
             f"{filename.split('.')[-1]}."
         )
-    with open(filename, 'rb') as f:
-        A = np.fromfile(f, np.float32).reshape((-1, 16)).T
+    try:
+        with open(filename, 'rb') as f:
+            A = np.fromfile(f, np.float32).reshape((-1, nchannel)).T
+    except Exception as exc:
+        raise IOError(
+            f"Error reading file {filename}: {exc}\n"
+            f"The number of channels (nchannel) may need to be adjusted based "
+            f"on the actual file format."
+        )
 
     data = {}
     # Create a Gaussian kernel for smoothing with sigma = 20
@@ -241,6 +253,7 @@ def import16chFlt(filename: str) -> SwimDataDict:
     ker /= np.sum(ker)
     ch1 = A[0, :]
     smch1 = np.convolve(ch1, ker, mode='same')
+    
     pow1 = (ch1 - smch1)**2
     ch2 = A[1, :]
     smch2 = np.convolve(ch2, ker, mode='same')
@@ -265,6 +278,15 @@ def import16chFlt(filename: str) -> SwimDataDict:
     data['swim_gain'] = A[13, :].astype(np.float64)
     data['swim_speed'] = A[14, :].astype(np.float64)
     data['turn_gain'] = A[15, :].astype(np.float64)
+    try:
+        data['led_power'] = A[16, :].astype(np.float64)
+        data['AI2'] = A[17, :].astype(np.float64)
+        data['AI3'] = A[18, :].astype(np.float64)
+        data['AI4'] = A[19, :].astype(np.float64)
+        data['map'] = A[20, :].astype(np.float64)
+    except:
+        pass
+        
     data = SwimDataDict(data, extension='.16chFlt')
     
     return data
