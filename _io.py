@@ -8,9 +8,15 @@ Modifications made on Mon Aug 25 15:51:06 2025
 to accommodate latest versions of Python, idiomatic use of NumPy, 
 and add some annotations for future learners.
 @Shuyang Yao
+
+Modifications made on Mon Feb 22 18:01:06 2026
+for
+1. Define import 16 channel
 """
 import numpy as np
 from ._classes import SwimDataDict
+import os
+import pickle
 
 class FileExtensionError(Exception):
     pass
@@ -283,7 +289,7 @@ def import16chFlt(filename: str, nchannel: int=21) -> SwimDataDict:
         data['AI2'] = A[17, :].astype(np.float64)
         data['AI3'] = A[18, :].astype(np.float64)
         data['AI4'] = A[19, :].astype(np.float64)
-        data['map'] = A[20, :].astype(np.float64)
+        data['map'] = A[20, :].astype(np.int64)
     except:
         pass
         
@@ -291,160 +297,36 @@ def import16chFlt(filename: str, nchannel: int=21) -> SwimDataDict:
     
     return data
 
-def importSuite2p(dir_path: str) -> dict:
-    """
-    Imports Suite2p output files from the specified directory.
-
-    Parameters
-    ----------
-    dir_path : str
-        The directory path containing Suite2p output files.
-
-    Returns
-    -------
-    data : dict
-        A dictionary containing Suite2p data.
-    """
-    # open numpy files
-    file_names = [
-        'ops.npy', 'stat.npy', 'iscell.npy', 'F.npy', 'Fneu.npy', 'spks.npy'
-    ]
-    data = {}
-    for file_name in file_names:
-        file_path = f"{dir_path}/{file_name}"
-        data[file_name.split('.')[0]] = np.load(file_path, allow_pickle=True)
-    return data
-
-def stackInits(data: dict, thrMag: float = 3.8) -> np.ndarray:
-    """
-    finds stack onset indices in ephys data.
-    
-    Parameter
-    ---------
-    data : dict
-        The imported data.\\
-        For *.10ch file, the data dictionary contains the following keys:
-        - 't': time vector
-        - 'ch0': channel 0 data
-        - 'ch1': channel 1 data
-        - 'fltCh0': filtered channel 0 data
-        - 'fltCh1': filtered channel 1 data
-        - 'camTrigger': camera trigger signal
-        - '2pTrigger': two-photon trigger signal
-        - 'drift': drift signal
-        - 'speed': speed signal
-        - 'gain': gain signal
-        - 'temp': ?
-        \\
-        For *.10chFlt files, the data dictionary contains the following keys:
-        - 't': time vector
-        - 'ch0': channel 0 data
-        - 'ch1': channel 1 data
-        - 'fltCh0': filtered channel 0 data
-        - 'fltCh1': filtered channel 1 data
-        - 'camTrigger': camera trigger signal
-        - 'drift': drift signal
-        - 'gain': gain signal
-    thrMag: float, by default 3.8
-        The threshold magnitude for detecting stack events.
-    """
-    stackInits = np.where(data['camTrigger'][:] > thrMag)[0]
-    initDiffs = np.where(np.diff(stackInits) > 1)[0]
-    initDiffs = np.concatenate(([0], initDiffs + 1))    
-    stackInits = stackInits[initDiffs]
-    return stackInits
-
-def getSwims(fltch, th = 2.5):
-
-    peaksT,peaksIndT = getPeaks(fltch)
-    thr = getThreshold(fltch,peaksT,90000, th)
-    burstIndT = peaksIndT[np.where(fltch[peaksIndT] > thr[peaksIndT])]
-    if len(burstIndT):
-        burstT = np.zeros(fltch.shape)
-        burstT[burstIndT] = 1
+def import_suite2p(file_dir: str)-> dict:
+    with open(os.path.join(file_dir, 'F.npy'), 'rb') as f:
+        RawTraces: np.ndarray = np.load(f, allow_pickle=True).astype(np.float64)
         
-        interSwims = np.diff(burstIndT)
-        swimEndIndB = np.where(interSwims > 800)[0]
-        swimEndIndB = np.concatenate((swimEndIndB,[burstIndT.size-1]))
-
-        swimStartIndB = swimEndIndB[0:-1] + 1
-        swimStartIndB = np.concatenate(([0], swimStartIndB))
-        nonShort = np.where(swimEndIndB != swimStartIndB)[0]
-        swimStartIndB = swimStartIndB[nonShort]
-        swimEndIndB = swimEndIndB[nonShort]
-      
-        bursts = np.zeros(fltch.size)
-        starts = np.zeros(fltch.size)
-        stops = np.zeros(fltch.size)
-        bursts[burstIndT] = 1
-        starts[burstIndT[swimStartIndB]] = 1
-        stops[burstIndT[swimEndIndB]] = 1
-    else:
-        starts = []
-        stops = []
-    return starts, stops, thr, bursts
-
-
-# filter signal, extract power
-def smoothPower(ch, kern):
-    smch = np.convolve(ch, kern, 'same')
-    power = (ch - smch)**2
-    fltch = np.convolve(power, kern, 'same')
-    return fltch
-
-# get peaks
-def getPeaks(fltch,deadTime=40):
-    
-    aa = np.diff(fltch)
-    peaks = (aa[0:-1] > 0) * (aa[1:] < 0)
-    inds = np.where(peaks)[0]    
-
-    # take the difference between consecutive indices
-    dInds = np.diff(inds)
-                    
-    # find differences greater than deadtime
-    toKeep = (dInds > deadTime)    
-    
-    # only keep the indices corresponding to differences greater than deadT 
-    inds[1::] = inds[1::] * toKeep
-    inds = inds[inds.nonzero()]
-    
-    peaks = np.zeros(fltch.size)
-    peaks[inds] = 1
-    
-    return peaks,inds
-
-# find threshold
-def getThreshold(fltch,peaks,wind=90000,shiftScale=2.5):
-    ''' edited by nvladimus '''
-    ''' edited by eyang '''
-    th = np.zeros(fltch.shape)
-    
-    for t in np.arange(0,fltch.size-wind, wind):
-
-        interval = np.arange(0, t+wind)
-        peaksInd = np.where(peaks[interval])        
-        xH = np.arange(0,np.min([fltch[peaksInd].max(),0.005]),1e-5) # changed upper value to max of signal
-        # make histogram of peak values
-        peakHist = np.histogram(fltch[peaksInd], xH)[0]
-        # find modal value
-        mx = np.min(np.where(peakHist == np.max(peakHist)))        
-        # find distance between mode and foot of left side of histogram
-        if xH[mx] <  np.percentile(fltch[peaksInd],40):
-            
-            bound=np.median(fltch[peaksInd])
-            
-        else:
-            bound=xH[mx]
-            
-        # in case the signal is skewered, use median instead
-        if peakHist[0] < peakHist[mx]/100.0:
-            mn = np.max(np.where(peakHist[0:mx] < peakHist[mx]/100.0))  
-        else:
-            mn = 0
-            
-        th[t:t+wind] =  bound + shiftScale * ( bound- xH[mn])
+    with open(os.path.join(file_dir, 'spks.npy'), 'rb') as f:
+        DeconvSignal: np.ndarray = np.load(f, allow_pickle=True).astype(np.float64)
         
+    with open(os.path.join(file_dir, 'ops.npy'), 'rb') as f:
+        obj: dict = np.load(f, allow_pickle=True).item()
+    
+    with open(os.path.join(file_dir, 'iscell.npy'), 'rb') as f:
+        iscell: np.ndarray = np.load(f, allow_pickle=True)
+        cell_prob: np.ndarray = iscell[:, 1].copy()
+        iscell = iscell[:, 0].copy().astype(np.int64)
         
-    th[t+wind:] = th[t+wind-1]
-    return th
+    trace={
+        'RawTraces': RawTraces,
+        'DeconvSignal': DeconvSignal,
+        'cell_prob': cell_prob,
+        'iscell': iscell,
+        'suite2p_version': obj['suite2p_version'],
+        'nplanes': obj['nplanes'],
+        'nchannels': obj['nchannels'],
+        'tau': obj['tau'],
+        'fs': obj['fs'],
+        'pretrained_model': obj['pretrained_model'],
+        'lenX': obj['lenX'],
+        'lenY': obj['lenY'],
+        'lenZ': obj['lenZ'],
+        'meanImg': obj['meanImg'],
+        'nframes': obj['nframes']
+    }
+    return trace
