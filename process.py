@@ -258,10 +258,10 @@ def run_LinearTrack1D(
 
 if __name__ == "__main__":
     info = {
-        "FishID": ["10135"],
+        "FishID": ["10136"],
         "session": [1],
-        "suite2p_dir": [r"D:\EnData\10135\S1\suite2p\combined"],
-        "behav_dir": [r"D:\EnData\10135\S1\res.16chFlt"]
+        "suite2p_dir": [r"E:\10136\S1_20260223_222901\combined"],
+        "behav_dir": [r"E:\10136\S1_20260223_222901\res.16chFlt"]
     }
     sheet_file = pd.DataFrame(info)
     for i in range(len(sheet_file)):
