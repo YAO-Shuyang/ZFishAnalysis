@@ -299,24 +299,52 @@ def import16chFlt(filename: str, nchannel: int=21) -> SwimDataDict:
 
 def import_suite2p(file_dir: str)-> dict:
     with open(os.path.join(file_dir, 'F.npy'), 'rb') as f:
-        RawTraces: np.ndarray = np.load(f, allow_pickle=True).astype(np.float64)
+        RawTraces: np.ndarray = np.asarray(np.load(f, allow_pickle=True), dtype=np.float32)
+        
+    with open(os.path.join(file_dir, 'Fneu.npy'), 'rb') as f:
+        NeuropilTraces: np.ndarray = np.asarray(np.load(f, allow_pickle=True), dtype=np.float32)
+
+    dF = RawTraces.copy() - 0.7 * NeuropilTraces
+    snr = 1 - 0.5 * np.diff(dF, axis=1).var(axis=1) / dF.var(axis=1)  
+        
+    with open(os.path.join(file_dir, 'stat.npy'), 'rb') as f:
+        stats: list = np.load(f, allow_pickle=True)
+    
+    try:
+        snr = np.array([stat['snr'] for stat in stats], dtype=np.float32)
+    except:
+        dF = RawTraces.copy() - 0.7 * NeuropilTraces
+        snr = 1 - 0.5 * np.diff(dF, axis=1).var(axis=1) / dF.var(axis=1)  
+        
+    rois = []
+    for stat in stats:
+        xpix = np.median(stat['xpix'])
+        ypix = np.median(stat['ypix'])
+        iplane = stat['iplane']
+        rois.append((xpix, ypix, iplane))
+    rois = np.asarray(rois, dtype=np.int32)
+    
+    idx = snr > 0.15
         
     with open(os.path.join(file_dir, 'spks.npy'), 'rb') as f:
-        DeconvSignal: np.ndarray = np.load(f, allow_pickle=True).astype(np.float64)
-        
+        DeconvSignal: np.ndarray = np.asarray(np.load(f, allow_pickle=True), dtype=np.float32)
+
+    RawTraces = RawTraces[idx, :]
+    DeconvSignal = DeconvSignal[idx, :]
+    Fneu = NeuropilTraces[idx, :]
+    snr = snr[idx]
+    rois = rois[idx, :]
+    
     with open(os.path.join(file_dir, 'ops.npy'), 'rb') as f:
         obj: dict = np.load(f, allow_pickle=True).item()
     
-    with open(os.path.join(file_dir, 'iscell.npy'), 'rb') as f:
-        iscell: np.ndarray = np.load(f, allow_pickle=True)
-        cell_prob: np.ndarray = iscell[:, 1].copy()
-        iscell = iscell[:, 0].copy().astype(np.int64)
-        
     trace={
         'RawTraces': RawTraces,
         'DeconvSignal': DeconvSignal,
-        'cell_prob': cell_prob,
-        'iscell': iscell,
+        'Fneu': Fneu,
+        'iscell': idx,
+        'roi_coord': rois,
+        'snr': snr,
         'suite2p_version': obj['suite2p_version'],
         'nplanes': obj['nplanes'],
         'nchannels': obj['nchannels'],

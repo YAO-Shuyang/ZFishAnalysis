@@ -142,6 +142,11 @@ def Clear_Axes(
     
     return ax
 
+def filt_init_mask(pos: np.ndarray, t: np.ndarray) -> np.ndarray:
+    """Return mask that filters out initialization phase, where position is set as 200 for the first 5 sec."""
+    mask = np.where((pos <= 100) & (t > 5))[0]
+    return mask
+
 def SubDict(
     data: LengthAlignedDict,
     idx: np.ndarray, 

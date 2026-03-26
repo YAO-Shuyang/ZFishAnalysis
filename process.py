@@ -5,8 +5,10 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 import pandas as pd
 import time
+import tifffile as tiff
 
 from zfish._io import import_suite2p, import16chFlt
+from zfish.analyzer import fast_gaussian_params
 
 from mazepy.basic.conversion import coordinate_recording_time
 from mazepy.datastruc.neuact import SpikeTrain, TuningCurve
@@ -30,6 +32,7 @@ def run_LinearTrack1D(
     i: int,
     sheet_file: pd.DataFrame,
     ds_behav_to: int = 50, # Hz
+    is_remove_iti: bool = True
 ) -> None:
     """process data collected on 1D linear track.
 
@@ -42,24 +45,31 @@ def run_LinearTrack1D(
     ds_behav_to : int, optional (Hz)
         The sampling rate to downsample the behavioral data to, by default 60.
     """
-    n_bin = 50
+    n_bin = 100
     n_speed_bin = 6
     speed_range = (2, 8)
     speed_smooth_win = 5
-    n_map = 2
-    map_ids = [2, 4]
+    n_map = 1#2
+    map_ids = [4]#[2, 4]
     assert n_map == len(map_ids), "n_map should be the same as the length of map_ids."
     
     suite2p_dir = sheet_file.loc[i, 'suite2p_dir']
     behav_dir = sheet_file.loc[i, 'behav_dir']
-    trace = import_suite2p(suite2p_dir)
-    res = import16chFlt(behav_dir, 21)
+
     print(
         f"{i},  Fish ID: {sheet_file.loc[i, 'FishID']}, session: "
         f"{sheet_file.loc[i, 'session']} --------"
     )
-    print("  1. Neural and behavioral data imported.")
+    
+    print("  1. Import Neural and behavioral data:")
+    trace = import_suite2p(suite2p_dir)
+    print("      a. Suite2p data imported.")
+    res = import16chFlt(behav_dir, 21)
+    print("      b. 16chFlt behavioral data imported.")
     save_dir = os.path.dirname(behav_dir)
+    processed_file = os.path.join(save_dir, "process")
+    os.makedirs(processed_file, exist_ok=True)
+    tiff.imwrite(os.path.join(save_dir, "mean_image.tif"), trace['meanImg'])
     
     trace['FishID'] = sheet_file.loc[i, 'FishID']
     trace['session'] = sheet_file.loc[i, 'session']
@@ -74,7 +84,7 @@ def run_LinearTrack1D(
     
     print("      a. Process neural data.")
     # Subtract the mean of each neuron (centering across time points)
-    for k in range(trace['RawTraces'].shape[0]):
+    for k in tqdm(range(trace['RawTraces'].shape[0])):
         meanrate = np.convolve(trace['RawTraces'][k], np.ones(200)/200, mode='same')
         meanrate[:200] = meanrate[200]
         meanrate[-200:] = meanrate[-201]
@@ -88,18 +98,27 @@ def run_LinearTrack1D(
     # Downsample behavioral data from 6000 Hz to the specified rate
     print("      b. Downsample behavioral data.")
     downsample_factor = int(6000 / ds_behav_to)
+    
+    # Smooth swim power before downsampling.
+    res['fltCh0'] = np.convolve(res['fltCh0'], np.ones(200)/200, mode='same')
+    res['fltCh1'] = np.convolve(res['fltCh1'], np.ones(200)/200, mode='same')
+    
     for k in res.keys():
         res[k] = res[k][::downsample_factor]
+
+    if res['Paradigm'][0] == 20260302:
+        res['behav_pos_y'] *= 2
+        
     # Convert behavioral time to ms and make it int
     behav_time = (res['behav_time']*1000).astype(np.int64)
     # Position is 0-100. Outliers indicate inter-trial intervals.
     behav_pos = res['behav_pos_y'].copy().astype(np.float64)
+    
     behav_pos[(behav_pos >= 100)| (behav_pos < 0)] = np.nan
-    trace['behav_time'] = behav_time
     trial_based_time = np.zeros_like(behav_time, dtype=np.int64)
 
     # Calculate trial start and end time.
-    within_trial_idx = np.where(np.isnan(behav_pos) == False)[0]
+    within_trial_idx = np.where((np.isnan(behav_pos) == False)&(behav_pos >= 0)&(behav_pos < 100))[0]
     trial_change_idx = np.where(np.diff(behav_pos[within_trial_idx]) < 0)[0] + 1
     lap_beg_idx = np.concatenate(([0], trial_change_idx))
     lap_end_idx = np.concatenate((trial_change_idx, [len(within_trial_idx)]))
@@ -107,7 +126,6 @@ def run_LinearTrack1D(
     trace['lap end time'] = behav_time[within_trial_idx][lap_end_idx-1]
     trace['lap_beg_idx'] = within_trial_idx[lap_beg_idx]
     trace['lap_end_idx'] = within_trial_idx[lap_end_idx-1]
-    print()
     
     for j in range(len(lap_beg_idx)):
         trial_based_time[within_trial_idx[lap_beg_idx[j]: lap_end_idx[j]]] = (
@@ -117,11 +135,9 @@ def run_LinearTrack1D(
         trial_based_time[within_trial_idx[lap_end_idx[j]-1]: within_trial_idx[lap_beg_idx[j+1]]] = (
             behav_time[within_trial_idx[lap_end_idx[j]-1]: within_trial_idx[lap_beg_idx[j+1]]] - behav_time[within_trial_idx[lap_beg_idx[j+1]]]
         )
-        print(trial_based_time[within_trial_idx[lap_end_idx[j]-1]: within_trial_idx[lap_beg_idx[j+1]]])
-    
+        
     trace['n_trials'] = len(lap_beg_idx)
     trace['map'] = res['map'][within_trial_idx][lap_beg_idx].astype(np.int64)
-    trace['behav_time_aligned'] = trial_based_time
     
     # Calculate speed
     print("      c. Process real-time speed.")
@@ -131,37 +147,62 @@ def run_LinearTrack1D(
         idx = within_trial_idx[lap_beg_idx[j]: lap_end_idx[j]]
         dt = np.append(np.diff(behav_time[idx]) / 1000, int(1/ds_behav_to))
         dx = np.append(np.diff(behav_pos[idx]), 0)
+        dx[dx<0] += 100
         behav_speed_raw[idx] = dx/dt
         # Smooth speed.
         behav_speed[idx] = np.convolve(
             dx, np.ones(speed_smooth_win), mode='same'
         ) / np.convolve(dt, np.ones(speed_smooth_win), mode='same') 
-    trace['behav_speed_raw'] = behav_speed_raw
-    trace['behav_speed'] = np.clip(behav_speed, speed_range[0], speed_range[1]) 
-    trace['behav_pos'] = behav_pos
-    trace['behav_nodes'] = (behav_pos//2)
-    trace['behav_nodes'][np.isnan(trace['behav_nodes'])] = -1
+    
+
+    n_len_per_bin = 100/n_bin
+    if is_remove_iti:
+        trace['behav_time'] = behav_time[within_trial_idx]
+        trace['behav_pos'] = behav_pos[within_trial_idx]
+        trace['fltCh0'] = res['fltCh0'][within_trial_idx]
+        trace['fltCh1'] = res['fltCh1'][within_trial_idx]
+        trace['behav_nodes'] = (behav_pos[within_trial_idx]//n_len_per_bin).astype(np.int64)
+        trace['behav_speed'] = np.clip(behav_speed[within_trial_idx], speed_range[0], speed_range[1]) 
+        trace['behav_speed_raw'] = behav_speed_raw[within_trial_idx]
+        trace['behav_time_aligned'] = trial_based_time[within_trial_idx]
+        trace['behav_trial'] = res['n_trials'][within_trial_idx]
+    else:
+        trace['behav_speed_raw'] = behav_speed_raw
+        trace['behav_speed'] = np.clip(behav_speed, speed_range[0], speed_range[1]) 
+        trace['behav_pos'] = behav_pos        
+        trace['behav_nodes'] = (behav_pos//n_len_per_bin).astype(np.int64)
+        trace['behav_time'] = behav_time
+        trace['behav_time_aligned'] = trial_based_time
+        trace['fltCh0'] = res['fltCh0']
+        trace['fltCh1'] = res['fltCh1']        
+        trace['behav_trial'] = res['n_trials']
+        
+    
+    
+    if is_remove_iti:
+        assert np.min(trace['behav_nodes']) >= 0 and np.max(trace['behav_nodes']) <= n_bin-1, \
+            f"behav_nodes should be in the range of [0, n_bin-1], but got " \
+            f"min={np.min(trace['behav_nodes'])} and max={np.max(trace['behav_nodes'])}."
+    else:
+        trace['behav_nodes'][np.isnan(trace['behav_nodes'])] = -1
     trace['behav_nodes'] = trace['behav_nodes'].astype(np.int64)
     
     # Coordinate neural activity and behavioral data
     print("      d. Coordinate neural activity and behavioral data.")
-    coord_idx = coordinate_recording_time(ms_time, behav_time)
-    ms_speed = behav_speed[coord_idx]
-    ms_pos = behav_pos[coord_idx]
+    coord_idx = coordinate_recording_time(ms_time, trace['behav_time'])
+    ms_speed = trace['behav_speed'][coord_idx]
+    ms_pos = trace['behav_pos'][coord_idx]
     ms_nodes = trace['behav_nodes'][coord_idx].astype(np.int64)
     ms_map = res['map'][coord_idx].astype(np.int64)
     ms_time_aligned = trace['behav_time_aligned'][coord_idx]
+    ms_trial = trace['behav_trial'][coord_idx]
     trace['ms_time'] = ms_time
     trace['ms_time_aligned'] = ms_time_aligned
     trace['ms_speed'] = ms_speed
     trace['ms_pos'] = ms_pos
     trace['spike_nodes'] = ms_nodes
     trace['ms_map'] = ms_map
-    spikes = np.where(
-        trace['DeconvSignal'] - 3*np.std(trace['DeconvSignal'], axis=1, keepdims=True) >= 0, 
-        1, 0
-    )
-    trace['Spikes'] = spikes
+    trace['ms_trial'] = ms_trial
         
     print("  3. Calculate Mean dF/F Map")
     print("      a. Linear Map 1D")
@@ -172,15 +213,14 @@ def run_LinearTrack1D(
     t_total = np.zeros(n_map, dtype=np.float64)
     t_nodes_frac = np.zeros((n_map, n_bin), dtype=np.float64)
     for n in range(n_map):
-        idx = np.where((ms_nodes >= 0) & (ms_map == map_ids[n]))[0]
-        spike_train = SpikeTrain(
-            spikes[:, idx],
-            time=trace['ms_time'][idx],
-            variable=VariableBin(ms_nodes[idx])
-        ) 
-        rate_map_all[:, :, n] = spike_train.calc_tuning_curve(nbins=n_bin, t_interv_limits=2000).to_array()
-        t_total[n] = spike_train.calc_total_time(t_interv_limits=2000) / 1000
-        t_nodes_frac[n, :] = spike_train.calc_occu_time(t_interv_limits=2000, nbins=n_bin) / 1000 / (t_total[n] + 1e-8)
+        for i in tqdm(range(n_bin)):
+            idx = np.where((ms_nodes == i) & (ms_map == map_ids[n]))[0]
+            rate_map_all[:, i, n] = np.nanmean(trace['RawTraces'][:, idx], axis=1)
+            t_nodes_frac[n, i] = idx.shape[0] / trace['fs']
+        t_total[n] = np.sum(t_nodes_frac[n, :])
+        t_nodes_frac[n, :] /= (t_total[n]+1e-8)
+    
+    rate_map_all[np.isnan(rate_map_all)] = 0.0
     trace['rate_map_all'] = rate_map_all
     
     # Smooth the rate map along the spatial dimension.
@@ -190,12 +230,21 @@ def run_LinearTrack1D(
     print("          Smooth the rate map.")
     smooth_map_all = np.zeros_like(rate_map_all)
     for n in range(n_map):
-        for i in range(trace['n_neuron']):
+        for i in tqdm(range(trace['n_neuron'])):
             smooth_map_all[i, :, n] = np.convolve(
                 rate_map_all[i, :, n], gkernel, mode='same'
             )
     trace['smooth_map_all'] = smooth_map_all
     
+    # Generate tuning curve estimated by fast Gaussian fitting.
+    print("          Fast Gaussian fitting.")
+    tuning_params = fast_gaussian_params(
+        np.linspace(100/n_bin/2, 100-100/n_bin/2, n_bin),
+        smooth_map_all[:, :, 0]
+    )
+    trace['tuning_params'] = tuning_params
+    
+    """
     print("      b. Speed Coupled Map 1D")
     speed_bin_size = (speed_range[1]-speed_range[0]+1e-8)/n_speed_bin
     trace['ms_speed_bin'] = (
@@ -212,17 +261,13 @@ def run_LinearTrack1D(
     speed_map_all = np.zeros(
         (trace['n_neuron'], n_bin, n_speed_bin, n_map), dtype=np.float64
     )
+    ms_nodes_speed = ms_nodes + n_bin * ms_speed_bin
     for n in range(n_map):
-        idx = np.where((ms_nodes >= 0) & (ms_speed_bin >= 0) & (ms_map == map_ids[n]))[0]
-        spike_train = SpikeTrain(
-            spikes[:, idx],
-            time=trace['ms_time'][idx],
-            variable=VariableBin(ms_nodes[idx] + n_bin * ms_speed_bin[idx])
-        )
-        tuning_curve_speed = spike_train.calc_tuning_curve(nbins=n_bin*n_speed_bin).to_array()
-        speed_map_all[:, :, :, n] = np.reshape(
-            tuning_curve_speed, (trace['n_neuron'], n_bin, n_speed_bin)
-        )
+        for i in range(n_bin*n_speed_bin):
+            idx = np.where((ms_nodes_speed == i) & (ms_map == map_ids[n]))[0]
+            speed_map_all[:, :, :, n] = np.reshape(
+                np.mean(trace['RawTraces'][:, idx], axis=1), (trace['n_neuron'], n_bin, n_speed_bin)
+            )
     trace['speed_map_all'] = speed_map_all
     
     # Smooth the speed map along the spatial dimension.
@@ -235,19 +280,7 @@ def run_LinearTrack1D(
                     speed_map_all[i, :, k, n], gkernel, mode='same'
                 )
     trace['speed_map_smooth'] = speed_map_smooth
-    
-    # Calculate information score
-    SI = np.zeros((trace['n_neuron'], n_map), dtype=np.float64)
-    for map in range(n_map):
-        idx = np.where((ms_nodes >= 0) & (ms_map == map_ids[map]))[0]
-        SI[:, map] = calc_SI(
-            spikes[:, idx], 
-            rate_map_all[:, :, map], 
-            t_total[map], 
-            t_nodes_frac[map, :]
-        )
-    trace['SI'] = SI
-    
+    """
     # Save the processed data
     save_path = os.path.join(save_dir, f"trace.pkl")
     with open(save_path, 'wb') as f:
@@ -258,10 +291,10 @@ def run_LinearTrack1D(
 
 if __name__ == "__main__":
     info = {
-        "FishID": ["10136"],
-        "session": [1],
-        "suite2p_dir": [r"E:\10136\S1_20260223_222901\combined"],
-        "behav_dir": [r"E:\10136\S1_20260223_222901\res.16chFlt"]
+        "FishID": ["10156"],
+        "session": [2],
+        "suite2p_dir": [r"D:\EnData\Light-sheet\10156\combined"],
+        "behav_dir": [r"D:\EnData\Light-sheet\10156\S2\res.16chFlt"]
     }
     sheet_file = pd.DataFrame(info)
     for i in range(len(sheet_file)):
