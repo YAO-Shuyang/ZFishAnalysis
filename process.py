@@ -6,9 +6,10 @@ from tqdm import tqdm
 import pandas as pd
 import time
 import tifffile as tiff
+from sklearn.feature_selection import mutual_info_regression
 
 from zfish._io import import_suite2p, import16chFlt
-from zfish.analyzer import fast_gaussian_params
+from zfish.analyzer import fast_gaussian_params, shuffle_test
 
 from mazepy.basic.conversion import coordinate_recording_time
 from mazepy.datastruc.neuact import SpikeTrain, TuningCurve
@@ -285,8 +286,43 @@ def run_LinearTrack1D(
     save_path = os.path.join(save_dir, f"trace.pkl")
     with open(save_path, 'wb') as f:
         pickle.dump(trace, f)
+        
+    print("      c. Save the processed data.")
+    print("  4. Shuffle test for spatial tuning.")
+    idx = np.where(np.diff(trace['ms_trial']) != 0)[0] + 1
+    trial_bound = np.zeros((idx.shape[0]+1, 2), dtype=np.int32)
+    trial_bound[0, 0] = 0
+    trial_bound[-1, 1] = trace['ms_trial'].shape[0]
+    trial_bound[1:, 0] = idx
+    trial_bound[:-1, 1] = idx
+    
+    p_values, ptp, shuf_ptp = shuffle_test(
+        dFF=trace['RawTraces'][:, 200:],
+        stim=trace['spike_nodes'][200:],
+        n_bins=trace['rate_map_all'].shape[1],
+        trial_bound=trial_bound,
+        n_shuffles=1000,
+        seed=42,
+        included_cells=np.where(trace['snr'] >= 0.5)[0]
+    )
+    
+    trace['p_values'] = p_values
+    trace['ptp'] = ptp
+    trace['shuf_ptp'] = shuf_ptp
+    with open(os.path.join(save_dir, f"trace.pkl"), 'wb') as f:
+        pickle.dump(trace, f)
+    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}      Shuffle test done and results saved.")
+
+    print("  5. Calculate mutual information.")
+    MI = np.zeros(trace['RawTraces'][:, 200:].shape[0], np.float32)
+    for i in tqdm(range(trace['RawTraces'].shape[0])):
+        MI[i] = mutual_info_regression(trace['RawTraces'][i, 200:].reshape(-1, 1), trace['spike_nodes'][200:])[0]
+    trace['mutual_info'] = MI
+    with open(os.path.join(save_dir, f"trace.pkl"), 'wb') as f:
+        pickle.dump(trace, f)
     # Print the finished time of processing
-    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}      Done.", end="\n\n\n")
+    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}      Mutual information calculation done and results saved.")
+    print(f"Done.", end="\n\n\n")
     
 
 if __name__ == "__main__":
