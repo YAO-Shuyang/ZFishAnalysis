@@ -261,3 +261,44 @@ def readout_paradigm(paradm_code: int) -> str:
         return 'Manual Optogenetics Pretest'
     else:
         raise ValueError(f'Unknown paradigm code: {paradm_code}')
+    
+def get_meanImg(trace: dict):
+    """
+    Get the mean image of the input trace.
+
+    Parameters
+    ----------
+    trace: dict
+        The input trace, which should contain 'meanImg' field.
+
+    Returns
+    -------
+    np.ndarray
+        The mean image of the input trace.
+    """
+    if 'meanImg' not in trace:
+        raise KeyError('The input trace does not contain "meanImg" field!')
+    
+    meanImg = trace['meanImg']
+    lenX = trace['lenX']
+    lenY = trace['lenY']
+    y_total, x_total = meanImg.shape
+    px, py = int(x_total / lenX), int(y_total / lenY)
+    n_plane = trace['nplanes']
+    
+    rois = trace['roi_coord']
+    rois_readjust = cp.deepcopy(rois)
+    for i in range(rois.shape[0]):
+        iplane = rois[i, 2]
+        xp, yp = iplane % px, iplane // px
+        rois_readjust[i, 0] = int(rois[i, 0] - xp*lenX)
+        rois_readjust[i, 1] = int(rois[i, 1] - yp*lenY)
+    
+    meanImgs = []
+    for i in range(n_plane):
+        nr, nc = i // px, i % px
+        meanImgs.append(meanImg[nr*lenY:(nr+1)*lenY, nc*lenX:(nc+1)*lenX])
+    meanImgs = np.stack(meanImgs, axis=2)
+    
+    return meanImgs, rois_readjust
+    

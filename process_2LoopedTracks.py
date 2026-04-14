@@ -46,14 +46,12 @@ def run_LinearTrack1D(
     ds_behav_to : int, optional (Hz)
         The sampling rate to downsample the behavioral data to, by default 60.
     """
-    n_bin = 45
+    n_bin = 100
     n_speed_bin = 6
     speed_range = (2, 8)
     speed_smooth_win = 5
-    n_map = 2#2
-    map_ids = [4,5]#[2, 4]
-    exclude_prefix = 100
-    
+    n_map = 1#2
+    map_ids = [4]#[2, 4]
     assert n_map == len(map_ids), "n_map should be the same as the length of map_ids."
     
     suite2p_dir = sheet_file.loc[i, 'suite2p_dir']
@@ -88,14 +86,14 @@ def run_LinearTrack1D(
     print("      a. Process neural data.")
     # Subtract the mean of each neuron (centering across time points)
     for k in tqdm(range(trace['RawTraces'].shape[0])):
-        meanrate = np.convolve(trace['RawTraces'][k], np.ones(exclude_prefix)/exclude_prefix, mode='same')
-        meanrate[:exclude_prefix] = meanrate[exclude_prefix]
-        meanrate[-exclude_prefix:] = meanrate[-exclude_prefix-1]
+        meanrate = np.convolve(trace['RawTraces'][k], np.ones(200)/200, mode='same')
+        meanrate[:200] = meanrate[200]
+        meanrate[-200:] = meanrate[-201]
         trace['RawTraces'][k] = trace['RawTraces'][k] - meanrate
         
-        mean_deconv = np.convolve(trace['DeconvSignal'][k], np.ones(exclude_prefix)/exclude_prefix, mode='same')
-        mean_deconv[:exclude_prefix] = mean_deconv[exclude_prefix]
-        mean_deconv[-exclude_prefix:] = mean_deconv[-exclude_prefix-1]
+        mean_deconv = np.convolve(trace['DeconvSignal'][k], np.ones(200)/200, mode='same')
+        mean_deconv[:200] = mean_deconv[200]
+        mean_deconv[-200:] = mean_deconv[-201]
         trace['DeconvSignal'][k] = trace['DeconvSignal'][k] - mean_deconv
 
     # Downsample behavioral data from 6000 Hz to the specified rate
@@ -109,7 +107,7 @@ def run_LinearTrack1D(
     for k in res.keys():
         res[k] = res[k][::downsample_factor]
 
-    if res['Paradigm'][0] in [20260302, 20260404]:
+    if res['Paradigm'][0] == 20260302:
         res['behav_pos_y'] *= 2
         
     # Convert behavioral time to ms and make it int
@@ -217,7 +215,7 @@ def run_LinearTrack1D(
     t_nodes_frac = np.zeros((n_map, n_bin), dtype=np.float64)
     for n in range(n_map):
         for i in tqdm(range(n_bin)):
-            idx = np.where((ms_nodes[exclude_prefix:] == i) & (ms_map[exclude_prefix:] == map_ids[n]))[0] + exclude_prefix
+            idx = np.where((ms_nodes == i) & (ms_map == map_ids[n]))[0]
             rate_map_all[:, i, n] = np.nanmean(trace['RawTraces'][:, idx], axis=1)
             t_nodes_frac[n, i] = idx.shape[0] / trace['fs']
         t_total[n] = np.sum(t_nodes_frac[n, :])
@@ -298,41 +296,27 @@ def run_LinearTrack1D(
     trial_bound[1:, 0] = idx
     trial_bound[:-1, 1] = idx
     
-    p_values_all = np.zeros((trace['n_neuron'], n_map), dtype=np.float64)
-    ptp_all = np.zeros((trace['n_neuron'], n_map), dtype=np.float64)
-    shuf_ptp_all = np.zeros((trace['n_neuron'], n_map, 1000), dtype=np.float64)
-    for n in range(n_map):
-        print(f"      Map {map_ids[n]}:")
-        idx = np.where(trace['ms_map'][exclude_prefix:] == map_ids[n])[0]+exclude_prefix
-        p_values, ptp, shuf_ptp = shuffle_test(
-            dFF=trace['RawTraces'][:, idx],
-            stim=trace['spike_nodes'][idx],
-            n_bins=trace['rate_map_all'].shape[1],
-            trial_bound=trial_bound,
-            n_shuffles=1000,
-            seed=42,
-            included_cells=np.where(trace['snr'] >= 0.5)[0]
-        )
-        p_values_all[:, n] = p_values
-        ptp_all[:, n] = ptp
-        shuf_ptp_all[:, n, :] = shuf_ptp
+    p_values, ptp, shuf_ptp = shuffle_test(
+        dFF=trace['RawTraces'][:, 200:],
+        stim=trace['spike_nodes'][200:],
+        n_bins=trace['rate_map_all'].shape[1],
+        trial_bound=trial_bound,
+        n_shuffles=1000,
+        seed=42,
+        included_cells=np.where(trace['snr'] >= 0.5)[0]
+    )
     
-    trace['p_values'] = p_values_all
-    trace['ptp'] = ptp_all
-    trace['shuf_ptp'] = shuf_ptp_all
+    trace['p_values'] = p_values
+    trace['ptp'] = ptp
+    trace['shuf_ptp'] = shuf_ptp
     with open(os.path.join(save_dir, f"trace.pkl"), 'wb') as f:
         pickle.dump(trace, f)
     print(f"{time.strftime('%Y-%m-%d %H:%M:%S')}      Shuffle test done and results saved.")
 
     print("  5. Calculate mutual information.")
-    MI = np.zeros((trace['RawTraces'].shape[0], n_map), np.float32)
-    map_idx = [np.where(trace['ms_map'][exclude_prefix:] == map_ids[n])[0]+exclude_prefix for n in range(n_map)]
+    MI = np.zeros(trace['RawTraces'][:, 200:].shape[0], np.float32)
     for i in tqdm(range(trace['RawTraces'].shape[0])):
-        for n in range(n_map):
-            MI[i, n] = mutual_info_regression(
-                trace['RawTraces'][i, map_idx[n]].reshape(-1, 1), 
-                trace['spike_nodes'][map_idx[n]]
-            )[0]
+        MI[i] = mutual_info_regression(trace['RawTraces'][i, 200:].reshape(-1, 1), trace['spike_nodes'][200:])[0]
     trace['mutual_info'] = MI
     with open(os.path.join(save_dir, f"trace.pkl"), 'wb') as f:
         pickle.dump(trace, f)
@@ -342,10 +326,10 @@ def run_LinearTrack1D(
 
 if __name__ == "__main__":
     info = {
-        "FishID": ["10158"],
+        "FishID": ["10156"],
         "session": [2],
-        "suite2p_dir": [r"D:\EnData\Light-sheet\10158\snr filtered"],
-        "behav_dir": [r"D:\EnData\Light-sheet\10158\S2\res.16chFlt"]
+        "suite2p_dir": [r"D:\EnData\Light-sheet\10156\combined"],
+        "behav_dir": [r"D:\EnData\Light-sheet\10156\S2\res.16chFlt"]
     }
     sheet_file = pd.DataFrame(info)
     for i in range(len(sheet_file)):

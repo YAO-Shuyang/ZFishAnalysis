@@ -78,7 +78,7 @@ def shuffle_test(
     seed: np.ndarray = None
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Perform a shuffle test to identify stimulus-responsive cells.
+    Perform a shuffle test (PTP) to identify stimulus-responsive cells.
 
     Parameters
     ----------
