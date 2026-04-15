@@ -5,6 +5,7 @@ from zfish._io import import16chFlt
 from typing import List, Sequence, Tuple, Optional
 
 import math
+import json
 import numpy as np
 import pandas as pd
 import torch
@@ -113,10 +114,7 @@ class SwimBoutDataset(Dataset):
         return len(self.indices)
 
     def _augment(self, x: np.ndarray) -> np.ndarray:
-        """
-        Lightweight augmentation for robustness.
-        x shape: (2, T)
-        """
+        """Lightweight augmentation for robustness. x shape: (2, T)."""
         scale = np.random.uniform(0.9, 1.1, size=(2, 1)).astype(np.float32)
         x = x * scale
 
@@ -139,7 +137,6 @@ class SwimBoutDataset(Dataset):
 
         x_tensor = torch.from_numpy(x)
         y_tensor = torch.from_numpy(y[None, :])
-
         return x_tensor, y_tensor
 
 
@@ -181,12 +178,7 @@ class DownBlock1D(nn.Module):
 
 
 class UpBlock1D(nn.Module):
-    """
-    Upsampling block:
-    - interpolate to match skip length
-    - concatenate skip
-    - ConvBlock
-    """
+    """Upsampling block: interpolate -> concatenate skip -> ConvBlock"""
 
     def __init__(self, in_ch: int, skip_ch: int, out_ch: int, kernel_size: int = 7) -> None:
         super().__init__()
@@ -206,11 +198,8 @@ class UpBlock1D(nn.Module):
 class UNet1D(nn.Module):
     """
     1D U-Net for framewise segmentation.
-
-    Input:
-        (B, 2, T)
-    Output:
-        (B, 1, T)
+    Input:  (B, 2, T)
+    Output: (B, 1, T)
     """
 
     def __init__(
@@ -274,7 +263,6 @@ class DiceLoss(nn.Module):
 
         intersection = (probs * targets).sum(dim=1)
         denom = probs.sum(dim=1) + targets.sum(dim=1)
-
         dice = (2.0 * intersection + self.smooth) / (denom + self.smooth)
         return 1.0 - dice.mean()
 
@@ -304,7 +292,7 @@ class BCEDiceLoss(nn.Module):
 
 
 # ============================================================
-# Training / evaluation
+# Metrics / helpers
 # ============================================================
 
 def compute_binary_metrics(
@@ -312,7 +300,6 @@ def compute_binary_metrics(
     targets: torch.Tensor,
     threshold: float = 0.5,
 ) -> dict:
-    """Compute simple framewise metrics."""
     preds = (probs >= threshold).float()
 
     tp = (preds * targets).sum().item()
@@ -333,161 +320,31 @@ def compute_binary_metrics(
     }
 
 
-def train_one_epoch(
-    model: nn.Module,
-    loader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    criterion: nn.Module,
-    device: torch.device,
-    grad_clip: Optional[float] = 1.0,
-) -> Tuple[float, dict]:
-    model.train()
-
-    total_loss = 0.0
-    metric_sums = {"precision": 0.0, "recall": 0.0, "f1": 0.0, "accuracy": 0.0}
-    n_batches = 0
-
-    for x, y in loader:
-        x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-
-        optimizer.zero_grad(set_to_none=True)
-
-        logits = model(x)
-        loss = criterion(logits, y)
-        loss.backward()
-
-        if grad_clip is not None:
-            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-
-        optimizer.step()
-
-        total_loss += loss.item()
-
-        with torch.no_grad():
-            probs = torch.sigmoid(logits)
-            metrics = compute_binary_metrics(probs, y)
-            for k in metric_sums:
-                metric_sums[k] += metrics[k]
-
-        n_batches += 1
-
-    avg_loss = total_loss / max(n_batches, 1)
-    avg_metrics = {k: v / max(n_batches, 1) for k, v in metric_sums.items()}
-    return avg_loss, avg_metrics
+def estimate_pos_weight(labels: Sequence[np.ndarray]) -> float:
+    total_pos = 0.0
+    total_count = 0.0
+    for y in labels:
+        y = y.astype(np.float32)
+        total_pos += y.sum()
+        total_count += y.size
+    total_neg = total_count - total_pos
+    pos_weight = total_neg / max(total_pos, 1.0)
+    return float(pos_weight)
 
 
-@torch.no_grad()
-def evaluate(
-    model: nn.Module,
-    loader: DataLoader,
-    criterion: nn.Module,
-    device: torch.device,
-) -> Tuple[float, dict]:
-    model.eval()
-
-    total_loss = 0.0
-    metric_sums = {"precision": 0.0, "recall": 0.0, "f1": 0.0, "accuracy": 0.0}
-    n_batches = 0
-
-    for x, y in loader:
-        x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-
-        logits = model(x)
-        loss = criterion(logits, y)
-        total_loss += loss.item()
-
-        probs = torch.sigmoid(logits)
-        metrics = compute_binary_metrics(probs, y)
-        for k in metric_sums:
-            metric_sums[k] += metrics[k]
-
-        n_batches += 1
-
-    avg_loss = total_loss / max(n_batches, 1)
-    avg_metrics = {k: v / max(n_batches, 1) for k, v in metric_sums.items()}
-    return avg_loss, avg_metrics
-
-
-# ============================================================
-# Full-recording inference
-# ============================================================
-
-@torch.no_grad()
-def predict_full_recording(
-    model: nn.Module,
-    signal: np.ndarray,
-    device: torch.device,
-    window_size: int = 6000,
-    stride: int = 1000,
-    normalize: bool = True,
-    batch_size: int = 16,
+def build_label_mask_from_intervals(
+    n_frames: int,
+    start_frame: np.ndarray,
+    end_frame: np.ndarray,
 ) -> np.ndarray:
-    """
-    Reconstruct framewise probabilities for a full recording.
-    """
-    if signal.ndim != 2 or signal.shape[0] != 2:
-        raise ValueError(f"signal must have shape (2, n_frames), got {signal.shape}")
+    y = np.zeros(n_frames, dtype=np.float32)
+    for s, e in zip(start_frame, end_frame):
+        s = int(max(0, s))
+        e = int(min(n_frames, e))
+        if e > s:
+            y[s:e] = 1.0
+    return y
 
-    x = signal.astype(np.float32, copy=True)
-
-    if normalize:
-        mean = x.mean(axis=1, keepdims=True)
-        std = x.std(axis=1, keepdims=True)
-        std = np.maximum(std, 1e-6)
-        x = (x - mean) / std
-
-    n_frames = x.shape[1]
-    if n_frames < window_size:
-        raise ValueError(f"Recording length {n_frames} is smaller than window_size {window_size}")
-
-    starts = list(range(0, n_frames - window_size + 1, stride))
-    if len(starts) == 0 or starts[-1] != n_frames - window_size:
-        starts.append(n_frames - window_size)
-
-    prob_sum = np.zeros(n_frames, dtype=np.float32)
-    prob_count = np.zeros(n_frames, dtype=np.float32)
-
-    model.eval()
-
-    batch_windows = []
-    batch_ranges = []
-
-    for start in starts:
-        end = start + window_size
-        x_win = x[:, start:end]
-        batch_windows.append(x_win)
-        batch_ranges.append((start, end))
-
-        if len(batch_windows) == batch_size:
-            x_batch = torch.from_numpy(np.stack(batch_windows, axis=0)).to(device)
-            logits = model(x_batch)
-            probs = torch.sigmoid(logits).squeeze(1).cpu().numpy()
-
-            for p, (s, e) in zip(probs, batch_ranges):
-                prob_sum[s:e] += p
-                prob_count[s:e] += 1.0
-
-            batch_windows = []
-            batch_ranges = []
-
-    if batch_windows:
-        x_batch = torch.from_numpy(np.stack(batch_windows, axis=0)).to(device)
-        logits = model(x_batch)
-        probs = torch.sigmoid(logits).squeeze(1).cpu().numpy()
-
-        for p, (s, e) in zip(probs, batch_ranges):
-            prob_sum[s:e] += p
-            prob_count[s:e] += 1.0
-
-    probs_full = prob_sum / np.maximum(prob_count, 1e-6)
-    return probs_full
-
-
-# ============================================================
-# Postprocessing
-# ============================================================
 
 def probs_to_bouts(
     probs: np.ndarray,
@@ -495,10 +352,6 @@ def probs_to_bouts(
     min_duration_frames: int = 300,
     min_gap_frames: int = 120,
 ) -> List[Tuple[int, int]]:
-    """
-    Convert probability trace into [(start, end), ...] intervals.
-    end is exclusive.
-    """
     if probs.ndim != 1:
         raise ValueError("probs must be a 1D array.")
 
@@ -521,7 +374,6 @@ def probs_to_bouts(
         segments.append((start, n))
 
     segments = [(s, e) for s, e in segments if (e - s) >= min_duration_frames]
-
     if not segments:
         return []
 
@@ -536,62 +388,11 @@ def probs_to_bouts(
     return merged
 
 
-# ============================================================
-# Helpers for single-recording block split
-# ============================================================
-
-def estimate_pos_weight(labels: Sequence[np.ndarray]) -> float:
-    """
-    Estimate positive class weight for BCEWithLogitsLoss:
-        pos_weight = #negative / #positive
-    """
-    total_pos = 0.0
-    total_count = 0.0
-    for y in labels:
-        y = y.astype(np.float32)
-        total_pos += y.sum()
-        total_count += y.size
-    total_neg = total_count - total_pos
-    pos_weight = total_neg / max(total_pos, 1.0)
-    return float(pos_weight)
-
-
-def build_label_mask_from_intervals(
-    n_frames: int,
-    start_frame: np.ndarray,
-    end_frame: np.ndarray,
-) -> np.ndarray:
-    """Build a framewise binary mask from labeled intervals."""
-    y = np.zeros(n_frames, dtype=np.float32)
-
-    for s, e in zip(start_frame, end_frame):
-        s = int(max(0, s))
-        e = int(min(n_frames, e))
-        if e > s:
-            y[s:e] = 1.0
-
-    return y
-
-
 def make_block_split_indices(
     dataset: SwimBoutDataset,
     n_blocks: int = 10,
     val_blocks: Optional[Sequence[int]] = None,
 ) -> tuple[list[int], list[int]]:
-    """
-    Split a single recording into contiguous time blocks and assign windows
-    to train/val based on full containment.
-
-    Parameters
-    ----------
-    dataset :
-        SwimBoutDataset built from a single recording.
-    n_blocks :
-        Number of contiguous blocks across the recording.
-    val_blocks :
-        Which block ids to use for validation.
-        Default: last 20% of blocks.
-    """
     if len(dataset.signals) != 1:
         raise ValueError("make_block_split_indices expects exactly one recording in the dataset.")
 
@@ -608,21 +409,15 @@ def make_block_split_indices(
     val_idx: list[int] = []
 
     for i, win in enumerate(dataset.indices):
-        assigned = False
         for b in range(n_blocks):
             block_start = block_edges[b]
             block_end = block_edges[b + 1]
-
-            # Window must lie fully within a block
             if win.start >= block_start and win.end <= block_end:
                 if b in val_blocks:
                     val_idx.append(i)
                 else:
                     train_idx.append(i)
-                assigned = True
                 break
-
-        # Windows crossing block boundaries are discarded
 
     if len(train_idx) == 0 or len(val_idx) == 0:
         raise ValueError(
@@ -633,250 +428,610 @@ def make_block_split_indices(
     return train_idx, val_idx
 
 
-def make_single_recording_block_dataloaders(
-    x: np.ndarray,
-    y: np.ndarray,
-    window_size: int = 6000,
-    stride_train: int = 1000,
-    stride_val: int = 1000,
-    batch_size: int = 16,
-    n_blocks: int = 10,
-    val_blocks: Optional[Sequence[int]] = None,
-    device_type: str = "cpu",
-) -> tuple[DataLoader, DataLoader, SwimBoutDataset, SwimBoutDataset]:
-    """
-    Create train/val dataloaders for a single recording using contiguous block split.
-    """
-    if stride_train != stride_val:
-        raise ValueError(
-            "For block-based splitting, it is best to use the same stride for train and val "
-            "so the split is clean and directly comparable."
-        )
-
-    base_train_ds = SwimBoutDataset(
-        [x],
-        [y],
-        window_size=window_size,
-        stride=stride_train,
-        normalize=True,
-        training=True,
-    )
-
-    base_val_ds = SwimBoutDataset(
-        [x],
-        [y],
-        window_size=window_size,
-        stride=stride_val,
-        normalize=True,
-        training=False,
-    )
-
-    if len(base_train_ds.indices) != len(base_val_ds.indices):
-        raise RuntimeError("Train and val base datasets should have identical indices here.")
-
-    train_idx, val_idx = make_block_split_indices(
-        dataset=base_train_ds,
-        n_blocks=n_blocks,
-        val_blocks=val_blocks,
-    )
-
-    train_ds = Subset(base_train_ds, train_idx)
-    val_ds = Subset(base_val_ds, val_idx)
-
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=0,
-        pin_memory=(device_type == "cuda"),
-        drop_last=False,
-    )
-
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=(device_type == "cuda"),
-        drop_last=False,
-    )
-
-    return train_loader, val_loader, base_train_ds, base_val_ds
-
-
-# ============================================================
-# Main training function
-# ============================================================
-
-def train_single_recording_block_split(
-    data_path: str,
-    label_path: str,
+@torch.no_grad()
+def predict_full_recording(
+    model: nn.Module,
+    signal: np.ndarray,
+    device: torch.device,
     window_size: int = 6000,
     stride: int = 1000,
+    normalize: bool = True,
     batch_size: int = 16,
-    num_epochs: int = 20,
-    lr: float = 1e-3,
-    weight_decay: float = 1e-4,
-    n_blocks: int = 10,
-    val_blocks: Optional[Sequence[int]] = None,
-    save_path: str = "unet1d_swim_bout.pt",
-) -> None:
+) -> np.ndarray:
     """
-    Train on one recording using a contiguous block split.
-    """
-    set_seed(42)
-    device = get_device()
-    print("Using device:", device)
-    if device.type == "cuda":
-        print("GPU:", torch.cuda.get_device_name(0))
+    Reconstruct framewise probabilities for a full recording.
 
-    # ---------------- Load recording ----------------
-    res = import16chFlt(data_path)
-    x = np.vstack((res["fltCh0"], res["fltCh1"])).astype(np.float32)
+    Parameters
+    ----------
+    model :
+        Trained segmentation model.
+    signal :
+        Array of shape (2, n_frames).
+    device :
+        Torch device.
+    window_size :
+        Inference window length.
+    stride :
+        Sliding-window stride.
+    normalize :
+        Whether to z-score each channel over the full recording.
+    batch_size :
+        Number of windows per inference batch.
+
+    Returns
+    -------
+    probs_full :
+        Array of shape (n_frames,) with probability in [0, 1].
+    """
+    if signal.ndim != 2 or signal.shape[0] != 2:
+        raise ValueError(f"signal must have shape (2, n_frames), got {signal.shape}")
+
+    x = signal.astype(np.float32, copy=True)
+
+    if normalize:
+        mean = x.mean(axis=1, keepdims=True)
+        std = x.std(axis=1, keepdims=True)
+        std = np.maximum(std, 1e-6)
+        x = (x - mean) / std
+
     n_frames = x.shape[1]
-
-    # ---------------- Load labels ----------------
-    try:
-        label_data = pd.read_excel(label_path, sheet_name="swim_bouts")
-    except Exception:
-        label_data = pd.read_excel(label_path)
-
-    required_cols = {"start_frame", "end_frame"}
-    if not required_cols.issubset(label_data.columns):
-        raise ValueError(f"Label file must contain columns: {sorted(required_cols)}")
-
-    start_frame = np.asarray(label_data["start_frame"], dtype=np.int64)
-    end_frame = np.asarray(label_data["end_frame"], dtype=np.int64)
-
-    if len(start_frame) == 0:
-        raise ValueError("No labeled swim bouts were found in the label file.")
-
-    if end_frame.max() > n_frames:
+    if n_frames < window_size:
         raise ValueError(
-            f"Label end_frame exceeds recording length: max end_frame={end_frame.max()}, n_frames={n_frames}"
+            f"Recording length {n_frames} is smaller than window_size {window_size}"
         )
 
-    y = build_label_mask_from_intervals(n_frames, start_frame, end_frame)
+    starts = list(range(0, n_frames - window_size + 1, stride))
+    if len(starts) == 0 or starts[-1] != n_frames - window_size:
+        starts.append(n_frames - window_size)
 
-    print(f"Recording length: {n_frames} frames")
-    print(f"Number of labeled bouts: {len(start_frame)}")
-    print(f"Positive fraction: {y.mean():.6f}")
+    prob_sum = np.zeros(n_frames, dtype=np.float32)
+    prob_count = np.zeros(n_frames, dtype=np.float32)
 
-    # ---------------- Create loaders ----------------
-    train_loader, val_loader, _, _ = make_single_recording_block_dataloaders(
-        x=x,
-        y=y,
-        window_size=window_size,
-        stride_train=stride,
-        stride_val=stride,
-        batch_size=batch_size,
-        n_blocks=n_blocks,
-        val_blocks=val_blocks,
-        device_type=device.type,
-    )
-
-    print(f"Train batches: {len(train_loader)}")
-    print(f"Val batches: {len(val_loader)}")
-
-    # ---------------- Model ----------------
-    model = UNet1D(
-        in_channels=2,
-        out_channels=1,
-        base_channels=32,
-        kernel_size=7,
-    ).to(device)
-
-    pos_weight = estimate_pos_weight([y])
-    print("Estimated pos_weight:", pos_weight)
-
-    criterion = BCEDiceLoss(pos_weight=pos_weight, dice_weight=0.5)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-
-    # ---------------- Train ----------------
-    best_val_f1 = -math.inf
-    best_state = None
-
-    for epoch in range(1, num_epochs + 1):
-        train_loss, train_metrics = train_one_epoch(
-            model, train_loader, optimizer, criterion, device
-        )
-
-        val_loss, val_metrics = evaluate(
-            model, val_loader, criterion, device
-        )
-
-        print(
-            f"Epoch {epoch:03d} | "
-            f"train_loss={train_loss:.4f} | "
-            f"val_loss={val_loss:.4f} | "
-            f"train_f1={train_metrics['f1']:.4f} | "
-            f"val_f1={val_metrics['f1']:.4f}"
-        )
-
-        if val_metrics["f1"] > best_val_f1:
-            best_val_f1 = val_metrics["f1"]
-            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-
-    if best_state is not None:
-        model.load_state_dict(best_state)
-        print(f"Loaded best model with val_f1={best_val_f1:.4f}")
-
-    # ---------------- Full-recording inference ----------------
-    probs_full = predict_full_recording(
-        model,
-        x,
-        device=device,
-        window_size=window_size,
-        stride=stride,
-        normalize=True,
-        batch_size=batch_size,
-    )
-
-    bouts = probs_to_bouts(
-        probs_full,
-        threshold=0.5,
-        min_duration_frames=int(0.03 * 6000),
-        min_gap_frames=int(0.02 * 6000),
-    )
-
-    print("Predicted bouts:", bouts[:20], "..." if len(bouts) > 20 else "")
-    print(f"Total predicted bouts: {len(bouts)}")
-
-    # ---------------- Save model ----------------
-    torch.save(model.state_dict(), save_path)
-    print(f"Saved model to {save_path}")
-
-
-import numpy as np
-import torch
-import pandas as pd
-from zfish._io import import16chFlt
-
-# Reuse your UNet1D, predict_full_recording, probs_to_bouts, get_device
-# definitions from training code.
-
-def load_trained_model(
-    checkpoint_path: str,
-    device: torch.device,
-    base_channels: int = 32,
-    kernel_size: int = 7,
-) -> torch.nn.Module:
-    model = UNet1D(
-        in_channels=2,
-        out_channels=1,
-        base_channels=base_channels,
-        kernel_size=kernel_size,
-    ).to(device)
-
-    state = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(state)
     model.eval()
-    return model
+
+    batch_windows: list[np.ndarray] = []
+    batch_ranges: list[tuple[int, int]] = []
+
+    for start in starts:
+        end = start + window_size
+        x_win = x[:, start:end]
+        batch_windows.append(x_win)
+        batch_ranges.append((start, end))
+
+        if len(batch_windows) == batch_size:
+            x_batch = torch.from_numpy(np.stack(batch_windows, axis=0)).to(device)
+            logits = model(x_batch)                          # (B, 1, T)
+            probs = torch.sigmoid(logits).squeeze(1).cpu().numpy()  # (B, T)
+
+            for p, (s, e) in zip(probs, batch_ranges):
+                prob_sum[s:e] += p
+                prob_count[s:e] += 1.0
+
+            batch_windows = []
+            batch_ranges = []
+
+    if batch_windows:
+        x_batch = torch.from_numpy(np.stack(batch_windows, axis=0)).to(device)
+        logits = model(x_batch)
+        probs = torch.sigmoid(logits).squeeze(1).cpu().numpy()
+
+        for p, (s, e) in zip(probs, batch_ranges):
+            prob_sum[s:e] += p
+            prob_count[s:e] += 1.0
+
+    probs_full = prob_sum / np.maximum(prob_count, 1e-6)
+    return probs_full
+
+
+class SwimBoutUNetDetector:
+    """
+    Convenience wrapper for training and inference.
+
+    Main methods:
+    - fit(...)
+    - fit_from_files(...)
+    - predict_proba(...)
+    - predict_bouts(...)
+    - predict_from_file(...)
+    - save(...)
+    - load(...)
+    """
+
+    def __init__(
+        self,
+        window_size: int = 6000,
+        stride: int = 1000,
+        batch_size: int = 16,
+        base_channels: int = 32,
+        kernel_size: int = 7,
+        threshold: float = 0.5,
+        min_duration_frames: int = 180,
+        min_gap_frames: int = 120,
+        lr: float = 1e-3,
+        weight_decay: float = 1e-4,
+        n_blocks: int = 10,
+        val_blocks: Optional[Sequence[int]] = None,
+        seed: int = 42,
+        device: Optional[torch.device] = None,
+    ) -> None:
+        self.window_size = int(window_size)
+        self.stride = int(stride)
+        self.batch_size = int(batch_size)
+        self.base_channels = int(base_channels)
+        self.kernel_size = int(kernel_size)
+        self.threshold = float(threshold)
+        self.min_duration_frames = int(min_duration_frames)
+        self.min_gap_frames = int(min_gap_frames)
+        self.lr = float(lr)
+        self.weight_decay = float(weight_decay)
+        self.n_blocks = int(n_blocks)
+        self.val_blocks = None if val_blocks is None else list(val_blocks)
+        self.seed = int(seed)
+
+        self.device = get_device() if device is None else device
+        self.model = UNet1D(
+            in_channels=2,
+            out_channels=1,
+            base_channels=self.base_channels,
+            kernel_size=self.kernel_size,
+        ).to(self.device)
+
+        self.history: List[dict] = []
+        self.best_val_f1: Optional[float] = None
+        self.is_fitted: bool = False
+
+    # ---------------- Internal helpers ----------------
+
+    def _make_dataloaders(
+        self,
+        x: np.ndarray,
+        y: np.ndarray,
+    ) -> tuple[DataLoader, DataLoader]:
+        train_base_ds = SwimBoutDataset(
+            [x],
+            [y],
+            window_size=self.window_size,
+            stride=self.stride,
+            normalize=True,
+            training=True,
+        )
+        val_base_ds = SwimBoutDataset(
+            [x],
+            [y],
+            window_size=self.window_size,
+            stride=self.stride,
+            normalize=True,
+            training=False,
+        )
+
+        if len(train_base_ds.indices) != len(val_base_ds.indices):
+            raise RuntimeError("Train and validation base datasets should have identical indices.")
+
+        train_idx, val_idx = make_block_split_indices(
+            dataset=train_base_ds,
+            n_blocks=self.n_blocks,
+            val_blocks=self.val_blocks,
+        )
+
+        train_ds = Subset(train_base_ds, train_idx)
+        val_ds = Subset(val_base_ds, val_idx)
+
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=0,
+            pin_memory=(self.device.type == "cuda"),
+            drop_last=False,
+        )
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=(self.device.type == "cuda"),
+            drop_last=False,
+        )
+        return train_loader, val_loader
+
+    def _train_one_epoch(
+        self,
+        loader: DataLoader,
+        optimizer: torch.optim.Optimizer,
+        criterion: nn.Module,
+        grad_clip: Optional[float] = 1.0,
+    ) -> Tuple[float, dict]:
+        self.model.train()
+
+        total_loss = 0.0
+        metric_sums = {"precision": 0.0, "recall": 0.0, "f1": 0.0, "accuracy": 0.0}
+        n_batches = 0
+
+        for x, y in loader:
+            x = x.to(self.device, non_blocking=True)
+            y = y.to(self.device, non_blocking=True)
+
+            optimizer.zero_grad(set_to_none=True)
+
+            logits = self.model(x)
+            loss = criterion(logits, y)
+            loss.backward()
+
+            if grad_clip is not None:
+                nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
+
+            optimizer.step()
+
+            total_loss += loss.item()
+
+            with torch.no_grad():
+                probs = torch.sigmoid(logits)
+                metrics = compute_binary_metrics(probs, y)
+                for k in metric_sums:
+                    metric_sums[k] += metrics[k]
+
+            n_batches += 1
+
+        avg_loss = total_loss / max(n_batches, 1)
+        avg_metrics = {k: v / max(n_batches, 1) for k, v in metric_sums.items()}
+        return avg_loss, avg_metrics
+
+    @torch.no_grad()
+    def _evaluate(
+        self,
+        loader: DataLoader,
+        criterion: nn.Module,
+    ) -> Tuple[float, dict]:
+        self.model.eval()
+
+        total_loss = 0.0
+        metric_sums = {"precision": 0.0, "recall": 0.0, "f1": 0.0, "accuracy": 0.0}
+        n_batches = 0
+
+        for x, y in loader:
+            x = x.to(self.device, non_blocking=True)
+            y = y.to(self.device, non_blocking=True)
+
+            logits = self.model(x)
+            loss = criterion(logits, y)
+            total_loss += loss.item()
+
+            probs = torch.sigmoid(logits)
+            metrics = compute_binary_metrics(probs, y)
+            for k in metric_sums:
+                metric_sums[k] += metrics[k]
+
+            n_batches += 1
+
+        avg_loss = total_loss / max(n_batches, 1)
+        avg_metrics = {k: v / max(n_batches, 1) for k, v in metric_sums.items()}
+        return avg_loss, avg_metrics
+
+    # ---------------- Public training API ----------------
+
+    def fit(
+        self,
+        x: np.ndarray,
+        y: np.ndarray,
+        num_epochs: int = 20,
+        verbose: bool = True,
+    ) -> "SwimBoutUNetDetector":
+        """
+        Train on one recording.
+
+        Parameters
+        ----------
+        x : np.ndarray
+            Shape (2, n_frames), usually np.vstack([fltCh0, fltCh1]).
+        y : np.ndarray
+            Shape (n_frames,), binary framewise mask.
+        """
+        set_seed(self.seed)
+
+        if x.ndim != 2 or x.shape[0] != 2:
+            raise ValueError(f"x must have shape (2, n_frames), got {x.shape}")
+        if y.ndim != 1:
+            raise ValueError(f"y must have shape (n_frames,), got {y.shape}")
+        if x.shape[1] != y.shape[0]:
+            raise ValueError(f"x/y length mismatch: {x.shape[1]} vs {y.shape[0]}")
+
+        x = x.astype(np.float32, copy=False)
+        y = y.astype(np.float32, copy=False)
+
+        train_loader, val_loader = self._make_dataloaders(x, y)
+
+        if verbose:
+            print("Using device:", self.device)
+            if self.device.type == "cuda":
+                print("GPU:", torch.cuda.get_device_name(0))
+            print(f"Train batches: {len(train_loader)}")
+            print(f"Val batches: {len(val_loader)}")
+            print(f"Positive fraction: {y.mean():.6f}")
+
+        pos_weight = estimate_pos_weight([y])
+        if verbose:
+            print("Estimated pos_weight:", pos_weight)
+
+        criterion = BCEDiceLoss(pos_weight=pos_weight, dice_weight=0.5)
+        optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=self.lr,
+            weight_decay=self.weight_decay,
+        )
+
+        self.history = []
+        best_val_f1 = -math.inf
+        best_state = None
+
+        for epoch in range(1, num_epochs + 1):
+            train_loss, train_metrics = self._train_one_epoch(
+                train_loader, optimizer, criterion
+            )
+            val_loss, val_metrics = self._evaluate(
+                val_loader, criterion
+            )
+
+            record = {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "train_precision": train_metrics["precision"],
+                "train_recall": train_metrics["recall"],
+                "train_f1": train_metrics["f1"],
+                "train_accuracy": train_metrics["accuracy"],
+                "val_precision": val_metrics["precision"],
+                "val_recall": val_metrics["recall"],
+                "val_f1": val_metrics["f1"],
+                "val_accuracy": val_metrics["accuracy"],
+            }
+            self.history.append(record)
+
+            if verbose:
+                print(
+                    f"Epoch {epoch:03d} | "
+                    f"train_loss={train_loss:.4f} | "
+                    f"val_loss={val_loss:.4f} | "
+                    f"train_f1={train_metrics['f1']:.4f} | "
+                    f"val_f1={val_metrics['f1']:.4f}"
+                )
+
+            if val_metrics["f1"] > best_val_f1:
+                best_val_f1 = val_metrics["f1"]
+                best_state = {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
+
+        if best_state is not None:
+            self.model.load_state_dict(best_state)
+
+        self.best_val_f1 = best_val_f1
+        self.is_fitted = True
+
+        if verbose:
+            print(f"Loaded best model with val_f1={best_val_f1:.4f}")
+
+        return self
+
+    def fit_from_files(
+        self,
+        data_path: str,
+        label_path: str,
+        num_epochs: int = 20,
+        verbose: bool = True,
+    ) -> "SwimBoutUNetDetector":
+        """
+        Train directly from a .16chFlt file and a label Excel file.
+        """
+        res = import16chFlt(data_path)
+        x = np.vstack((res["fltCh0"], res["fltCh1"])).astype(np.float32)
+        n_frames = x.shape[1]
+
+        try:
+            label_data = pd.read_excel(label_path, sheet_name="swim_bouts")
+        except Exception:
+            label_data = pd.read_excel(label_path)
+
+        required_cols = {"start_frame", "end_frame"}
+        if not required_cols.issubset(label_data.columns):
+            raise ValueError(f"Label file must contain columns: {sorted(required_cols)}")
+
+        start_frame = np.asarray(label_data["start_frame"], dtype=np.int64)
+        end_frame = np.asarray(label_data["end_frame"], dtype=np.int64)
+
+        if len(start_frame) == 0:
+            raise ValueError("No labeled swim bouts were found in the label file.")
+        if end_frame.max() > n_frames:
+            raise ValueError(
+                f"Label end_frame exceeds recording length: max end_frame={end_frame.max()}, n_frames={n_frames}"
+            )
+
+        y = build_label_mask_from_intervals(n_frames, start_frame, end_frame)
+        return self.fit(x=x, y=y, num_epochs=num_epochs, verbose=verbose)
+
+    # ---------------- Public inference API ----------------
+    @torch.no_grad()
+    def predict_proba(
+        self,
+        x: np.ndarray,
+        batch_size: Optional[int] = None,
+    ) -> np.ndarray:
+        """
+        Predict framewise swim-bout probability for a recording.
+
+        Parameters
+        ----------
+        x : np.ndarray
+            Shape (2, n_frames)
+
+        Returns
+        -------
+        probs : np.ndarray
+            Shape (n_frames,), values in [0, 1]
+        """
+        if batch_size is None:
+            batch_size = self.batch_size
+
+        if x.ndim != 2 or x.shape[0] != 2:
+            raise ValueError(f"x must have shape (2, n_frames), got {x.shape}")
+
+        return predict_full_recording(
+            model=self.model,
+            signal=x,
+            device=self.device,
+            window_size=self.window_size,
+            stride=self.stride,
+            normalize=True,
+            batch_size=batch_size,
+        )
+
+
+    @torch.no_grad()
+    def predict_label(
+        self,
+        x: np.ndarray,
+        threshold: Optional[float] = None,
+        batch_size: Optional[int] = None,
+    ) -> np.ndarray:
+        """
+        Predict framewise binary label for a recording.
+
+        Parameters
+        ----------
+        x : np.ndarray
+            Shape (2, n_frames)
+        threshold : float, optional
+            Threshold applied to probabilities. Defaults to self.threshold.
+
+        Returns
+        -------
+        labels : np.ndarray
+            Shape (n_frames,), dtype uint8, values {0, 1}
+        """
+        if threshold is None:
+            threshold = self.threshold
+
+        probs = self.predict_proba(x, batch_size=batch_size)
+        labels = (probs >= threshold).astype(np.uint8)
+        return labels
+
+    def predict(
+        self,
+        data_path: str,
+        threshold: Optional[float] = None,
+        min_duration_frames: Optional[int] = None,
+        min_gap_frames: Optional[int] = None,
+        batch_size: Optional[int] = None,
+        return_probs: bool = False,
+    ) -> np.ndarray:
+        res = import16chFlt(data_path)
+        x = np.vstack((res["fltCh0"], res["fltCh1"])).astype(np.float32)
+        if return_probs:
+            return self.predict_proba(x, batch_size=batch_size)
+        else:
+            return self.predict_label(x, threshold=threshold, batch_size=batch_size)
+
+    # ---------------- Save / load ----------------
+
+    def save(self, path: str) -> None:
+        """
+        Save model weights and config.
+        """
+        payload = {
+            "state_dict": self.model.state_dict(),
+            "config": {
+                "window_size": self.window_size,
+                "stride": self.stride,
+                "batch_size": self.batch_size,
+                "base_channels": self.base_channels,
+                "kernel_size": self.kernel_size,
+                "threshold": self.threshold,
+                "min_duration_frames": self.min_duration_frames,
+                "min_gap_frames": self.min_gap_frames,
+                "lr": self.lr,
+                "weight_decay": self.weight_decay,
+                "n_blocks": self.n_blocks,
+                "val_blocks": self.val_blocks,
+                "seed": self.seed,
+            },
+            "history": self.history,
+            "best_val_f1": self.best_val_f1,
+        }
+        torch.save(payload, path)
+
+    @classmethod
+    def load(
+        cls,
+        path: str,
+        device: Optional[torch.device] = None,
+    ) -> "SwimBoutUNetDetector":
+        """
+        Load a saved detector.
+        """
+        map_device = get_device() if device is None else device
+        payload = torch.load(path, map_location=map_device)
+
+        config = payload["config"]
+        detector = cls(
+            window_size=config["window_size"],
+            stride=config["stride"],
+            batch_size=config["batch_size"],
+            base_channels=config["base_channels"],
+            kernel_size=config["kernel_size"],
+            threshold=config["threshold"],
+            min_duration_frames=config["min_duration_frames"],
+            min_gap_frames=config["min_gap_frames"],
+            lr=config["lr"],
+            weight_decay=config["weight_decay"],
+            n_blocks=config["n_blocks"],
+            val_blocks=config["val_blocks"],
+            seed=config["seed"],
+            device=map_device,
+        )
+
+        detector.model.load_state_dict(payload["state_dict"])
+        detector.model.eval()
+        detector.history = payload.get("history", [])
+        detector.best_val_f1 = payload.get("best_val_f1", None)
+        detector.is_fitted = True
+        return detector
+
+
+# ============================================================
+# Example usage
+# ============================================================
 
 if __name__ == "__main__":
-    train_single_recording_block_split(
+    import matplotlib.pyplot as plt
+    detector = SwimBoutUNetDetector(
+        window_size=6000,
+        stride=1000,
+        batch_size=16,
+        base_channels=32,
+        kernel_size=7,
+        threshold=0.5,
+        min_duration_frames=180,
+        min_gap_frames=120,
+        lr=1e-3,
+        weight_decay=1e-4,
+        n_blocks=10,
+        val_blocks=None,
+        seed=42,
+    )
+
+    detector.fit_from_files(
         data_path=r"D:\EnData\10161\S1\res.16chFlt",
         label_path=r"D:\EnData\10161\S1\labeled_bouts.xlsx",
-        batch_size=16,
-        num_epochs=13
+        num_epochs=25,
+        verbose=True,
     )
+
+    detector.save(r"D:\EnData\10161\S1\swim_detector.pt")
+
+    # Load later:
+    # detector = SwimBoutUNetDetector.load(r"D:\EnData\10161\S1\swim_detector.pt")
+
+    bout_labels = detector.predict(
+        data_path=r"D:\EnData\10161\S2\res.16chFlt",
+        return_probs=True,
+    )
+
+    plt.plot(bout_labels, label="Predicted Probability", linewidth=0.5)
+    plt.show()
