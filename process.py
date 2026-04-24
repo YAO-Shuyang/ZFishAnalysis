@@ -91,12 +91,12 @@ def run_LinearTrack1D(
         meanrate = np.convolve(trace['RawTraces'][k], np.ones(exclude_prefix)/exclude_prefix, mode='same')
         meanrate[:exclude_prefix] = meanrate[exclude_prefix]
         meanrate[-exclude_prefix:] = meanrate[-exclude_prefix-1]
-        trace['RawTraces'][k] = trace['RawTraces'][k] - meanrate
+        trace['RawTraces'][k] = (trace['RawTraces'][k]-meanrate) / meanrate
         
         mean_deconv = np.convolve(trace['DeconvSignal'][k], np.ones(exclude_prefix)/exclude_prefix, mode='same')
         mean_deconv[:exclude_prefix] = mean_deconv[exclude_prefix]
         mean_deconv[-exclude_prefix:] = mean_deconv[-exclude_prefix-1]
-        trace['DeconvSignal'][k] = trace['DeconvSignal'][k] - mean_deconv
+        trace['DeconvSignal'][k] = (trace['DeconvSignal'][k]-mean_deconv) / mean_deconv
 
     # Downsample behavioral data from 6000 Hz to the specified rate
     print("      b. Downsample behavioral data.")
@@ -109,7 +109,7 @@ def run_LinearTrack1D(
     for k in res.keys():
         res[k] = res[k][::downsample_factor]
 
-    if res['Paradigm'][0] in [20260302, 20260404]:
+    if res['Paradigm'][0] in [20260302, 20260404, 20260410]:
         res['behav_pos_y'] *= 2
         
     # Convert behavioral time to ms and make it int
@@ -213,18 +213,42 @@ def run_LinearTrack1D(
     rate_map_all = np.zeros(
         (trace['n_neuron'], n_bin, n_map), dtype=np.float64
     )
+    rate_map_fir = np.zeros_like(rate_map_all)
+    rate_map_sec = np.zeros_like(rate_map_all)
     t_total = np.zeros(n_map, dtype=np.float64)
     t_nodes_frac = np.zeros((n_map, n_bin), dtype=np.float64)
+    
+    map_indices = [
+        np.where(ms_map[exclude_prefix:] == map_id)[0]+exclude_prefix for map_id in map_ids
+    ]
+    map_checked_points = np.vstack([
+        [iit[0], int((iit[0]+iit[-1])/2), iit[-1]] for iit in map_indices
+    ])
     for n in range(n_map):
         for i in tqdm(range(n_bin)):
             idx = np.where((ms_nodes[exclude_prefix:] == i) & (ms_map[exclude_prefix:] == map_ids[n]))[0] + exclude_prefix
             rate_map_all[:, i, n] = np.nanmean(trace['RawTraces'][:, idx], axis=1)
             t_nodes_frac[n, i] = idx.shape[0] / trace['fs']
+            
+            onset, mid, offset = map_checked_points[n, :]
+            idx_fir = np.where((ms_nodes[onset:mid] == i))[0] + onset
+            
+            if idx_fir.shape[0] > 0:
+                rate_map_fir[:, i, n] = np.nanmean(trace['RawTraces'][:, idx_fir], axis=1)
+                
+            idx_sec = np.where((ms_nodes[mid:offset] == i))[0] + mid
+            if idx_sec.shape[0] > 0:
+                rate_map_sec[:, i, n] = np.nanmean(trace['RawTraces'][:, idx_sec], axis=1)
+                
         t_total[n] = np.sum(t_nodes_frac[n, :])
         t_nodes_frac[n, :] /= (t_total[n]+1e-8)
     
     rate_map_all[np.isnan(rate_map_all)] = 0.0
+    rate_map_fir[np.isnan(rate_map_fir)] = 0.0
+    rate_map_sec[np.isnan(rate_map_sec)] = 0.0
     trace['rate_map_all'] = rate_map_all
+    trace['rate_map_fir'] = rate_map_fir
+    trace['rate_map_sec'] = rate_map_sec
     
     # Smooth the rate map along the spatial dimension.
     sigma = 1
@@ -232,13 +256,33 @@ def run_LinearTrack1D(
     gkernel /= gkernel.sum()
     print("          Smooth the rate map.")
     smooth_map_all = np.zeros_like(rate_map_all)
+    smooth_map_fir = np.zeros_like(rate_map_fir)
+    smooth_map_sec = np.zeros_like(rate_map_sec)
     for n in range(n_map):
         for i in tqdm(range(trace['n_neuron'])):
             smooth_map_all[i, :, n] = np.convolve(
                 rate_map_all[i, :, n], gkernel, mode='same'
             )
+            smooth_map_fir[i, :, n] = np.convolve(
+                rate_map_fir[i, :, n], gkernel, mode='same'
+            )
+            smooth_map_sec[i, :, n] = np.convolve(
+                rate_map_sec[i, :, n], gkernel, mode='same'
+            )
     trace['smooth_map_all'] = smooth_map_all
+    trace['smooth_map_fir'] = smooth_map_fir
+    trace['smooth_map_sec'] = smooth_map_sec
     
+    half_half_corr = np.zeros((trace['n_neuron'], n_map), dtype=np.float64)
+    print("          Calculate the half-half correlation of the rate map.")
+    for n in range(n_map):
+        for i in tqdm(range(trace['n_neuron']), desc=f"Map {map_ids[n]}"):
+            half_half_corr[i, n] = np.corrcoef(
+                rate_map_fir[i, :, n], rate_map_sec[i, :, n]
+            )[0, 1]
+            
+    trace['fir_sec_corr'] = half_half_corr
+
     # Generate tuning curve estimated by fast Gaussian fitting.
     print("          Fast Gaussian fitting.")
     tuning_params = fast_gaussian_params(
@@ -342,10 +386,10 @@ def run_LinearTrack1D(
 
 if __name__ == "__main__":
     info = {
-        "FishID": ["10158"],
+        "FishID": ["10162"],
         "session": [2],
-        "suite2p_dir": [r"D:\EnData\Light-sheet\10158\snr filtered"],
-        "behav_dir": [r"D:\EnData\Light-sheet\10158\S2\res.16chFlt"]
+        "suite2p_dir": [r"D:\EnData\Light-sheet\10162\snr filtered"],
+        "behav_dir": [r"D:\EnData\Light-sheet\spatial preference vr1\10162\S2\res.16chFlt"]
     }
     sheet_file = pd.DataFrame(info)
     for i in range(len(sheet_file)):
