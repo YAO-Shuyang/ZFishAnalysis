@@ -29,11 +29,255 @@ def calc_SI(
     SI = IC / mean_rate; # spatial information (bits/spike)
     return(SI)
 
+import os
+import numpy as np
+from tqdm import tqdm
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+
+def _shuffle_ptp_worker(args):
+    """
+    Worker function for parallel shuffle test.
+
+    Each worker computes a subset of shuffle iterations.
+    """
+    (
+        dFF_c,
+        stim,
+        bin_idx,
+        trial_bound,
+        n_bins,
+        n_local_shuffles,
+        seed,
+    ) = args
+
+    rng = np.random.default_rng(seed)
+
+    n_cells = dFF_c.shape[0]
+    n_time = dFF_c.shape[1]
+
+    shuf_ptp = np.zeros((n_cells, n_local_shuffles), dtype=np.float64)
+
+    for i in range(n_local_shuffles):
+        # Important: reset the index for each shuffle.
+        shuf_idx = np.arange(n_time)
+
+        # Circularly shift activity within each trial.
+        for t in range(trial_bound.shape[0]):
+            start, end = trial_bound[t]
+
+            if end <= start + 1:
+                continue
+
+            shuf_dist = rng.integers(0, end - start)
+            shuf_idx[start:end] = np.roll(shuf_idx[start:end], shuf_dist)
+
+        shuf_responses = np.zeros((n_cells, n_bins), dtype=np.float64)
+
+        for j in range(n_bins):
+            if bin_idx[j].size == 0:
+                shuf_responses[:, j] = np.nan
+            else:
+                shuf_responses[:, j] = np.nanmean(
+                    dFF_c[:, shuf_idx[bin_idx[j]]],
+                    axis=1,
+                )
+
+        shuf_ptp[:, i] = np.nanmax(shuf_responses, axis=1) - np.nanmin(
+            shuf_responses,
+            axis=1,
+        )
+
+    return shuf_ptp
+
+
+def shuffle_test_parallel(
+    dFF: np.ndarray,
+    stim: np.ndarray,
+    n_bins: int,
+    trial_bound: np.ndarray,
+    n_shuffles: int = 1000,
+    included_cells: np.ndarray | None = None,
+    seed: int | None = 42,
+    n_workers: int | None = None,
+    shuffles_per_task: int = 10,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Parallel shuffle test for stimulus-responsive cells.
+
+    Parameters
+    ----------
+    dFF : np.ndarray, shape (n_cells, n_time)
+        dF/F traces.
+    stim : np.ndarray, shape (n_time,)
+        Stimulus/bin labels.
+    n_bins : int
+        Number of stimulus/spatial bins.
+    trial_bound : np.ndarray, shape (n_trials, 2)
+        Trial boundaries in the local time coordinates of dFF and stim.
+    n_shuffles : int
+        Number of shuffles.
+    included_cells : np.ndarray or None
+        Global cell indices to include.
+    seed : int or None
+        Random seed.
+    n_workers : int or None
+        Number of processes.
+
+    Returns
+    -------
+    p_values_return : np.ndarray, shape (n_cells,)
+        Shuffle-test p-values.
+    ptp : np.ndarray, shape (n_cells,)
+        Observed PTP values.
+    shuf_ptp_return : np.ndarray, shape (n_cells, n_shuffles)
+        Shuffled PTP values.
+    """
+    stim = np.asarray(stim, dtype=np.int32).copy()
+    trial_bound = np.asarray(trial_bound, dtype=np.int32)
+
+    assert np.min(stim) >= 0, "stimulus labels must be non-negative integers"
+    assert np.max(stim) < n_bins, "stimulus labels must be less than n_bins"
+    assert dFF.shape[1] == stim.shape[0], (
+        f"dFF and stim length mismatch: dFF has {dFF.shape[1]} time points, "
+        f"but stim has {stim.shape[0]}."
+    )
+    assert np.max(trial_bound) <= dFF.shape[1], (
+        "trial_bound contains indices larger than the local dFF/stim length. "
+        "You probably need to recompute local trial boundaries after subsetting idx."
+    )
+
+    if included_cells is None:
+        included_cells = np.arange(dFF.shape[0], dtype=np.int64)
+    else:
+        included_cells = np.asarray(included_cells, dtype=np.int64)
+
+    if n_workers is None:
+        n_workers = max(1, (os.cpu_count() or 2) - 1)
+
+    if seed is None:
+        seed = 0
+
+    # Use only included cells for expensive computation.
+    dFF_c = np.ascontiguousarray(dFF[included_cells, :], dtype=np.float64)
+
+    # Precompute bin indices.
+    bin_idx = [np.where(stim == i)[0] for i in range(n_bins)]
+
+    # Observed response map.
+    mean_responses = np.zeros((included_cells.shape[0], n_bins), dtype=np.float64)
+
+    for i in range(n_bins):
+        if bin_idx[i].size == 0:
+            mean_responses[:, i] = np.nan
+        else:
+            mean_responses[:, i] = np.nanmean(dFF_c[:, bin_idx[i]], axis=1)
+
+    # Observed PTP for included cells.
+    ptp_included = np.nanmax(mean_responses, axis=1) - np.nanmin(
+        mean_responses,
+        axis=1,
+    )
+
+    # Split shuffle iterations across workers.
+    n_workers = min(n_workers, n_shuffles)
+    base = n_shuffles // n_workers
+    remainder = n_shuffles % n_workers
+
+    local_shuffle_counts = [
+        base + (1 if i < remainder else 0)
+        for i in range(n_workers)
+    ]
+
+    tasks = []
+    for worker_id, n_local in enumerate(local_shuffle_counts):
+        if n_local == 0:
+            continue
+
+        tasks.append(
+            (
+                dFF_c,
+                stim,
+                bin_idx,
+                trial_bound,
+                n_bins,
+                n_local,
+                seed + worker_id,
+            )
+        )
+
+    print(
+        f"Running parallel shuffle test: "
+        f"{n_shuffles} shuffles, {len(tasks)} workers, "
+        f"{included_cells.shape[0]} included cells."
+    )
+
+    shuf_chunks = []
+
+    with ProcessPoolExecutor(max_workers=len(tasks)) as executor:
+        futures = [executor.submit(_shuffle_ptp_worker, task) for task in tasks]
+
+        for future in tqdm(
+            as_completed(futures),
+            total=len(futures),
+            desc="Shuffle workers",
+        ):
+            shuf_chunks.append(future.result())
+
+    shuf_ptp_included = np.concatenate(shuf_chunks, axis=1)
+
+    # Because workers may finish in arbitrary order, the shuffle columns are unordered.
+    # That is fine for p-values, because only the distribution matters.
+
+    # Correct one-sided p-value:
+    p_values_included = (
+        np.sum(
+            shuf_ptp_included >= ptp_included[:, np.newaxis],
+            axis=1,
+        )
+        + 1
+    ) / (n_shuffles + 1)
+
+    # Return full-size arrays.
+    p_values_return = np.ones(dFF.shape[0], dtype=np.float64) * np.nan
+    ptp_return = np.ones(dFF.shape[0], dtype=np.float64) * np.nan
+    shuf_ptp_return = np.ones((dFF.shape[0], n_shuffles), dtype=np.float64) * np.nan
+
+    p_values_return[included_cells] = p_values_included
+    ptp_return[included_cells] = ptp_included
+    shuf_ptp_return[included_cells, :] = shuf_ptp_included
+
+    return p_values_return, ptp_return, shuf_ptp_return
+
+def make_local_trial_bound_from_trial_ids(trial_ids: np.ndarray) -> np.ndarray:
+    """
+    Construct local trial boundaries after temporal subsetting.
+
+    Parameters
+    ----------
+    trial_ids : np.ndarray, shape (n_time,)
+        Trial identity for each selected time point.
+
+    Returns
+    -------
+    trial_bound : np.ndarray, shape (n_trials, 2)
+        Local start/end indices.
+    """
+    trial_ids = np.asarray(trial_ids)
+
+    change_idx = np.where(np.diff(trial_ids) != 0)[0] + 1
+
+    starts = np.concatenate([[0], change_idx])
+    ends = np.concatenate([change_idx, [trial_ids.shape[0]]])
+
+    return np.vstack([starts, ends]).T.astype(np.int32)
+
 def run_LinearTrack1D(
     i: int,
     sheet_file: pd.DataFrame,
     ds_behav_to: int = 50, # Hz
-    is_remove_iti: bool = True
+    is_remove_iti: bool = True,
+    n_shuffle: int = 1000
 ) -> None:
     """process data collected on 1D linear track.
 
@@ -45,13 +289,17 @@ def run_LinearTrack1D(
         The sheet file containing the session information.
     ds_behav_to : int, optional (Hz)
         The sampling rate to downsample the behavioral data to, by default 60.
+    is_remove_iti : bool, optional
+        Whether to remove inter-trial intervals (ITIs) from the analysis, by default True.
+    n_shuffle : int, optional
+        The number of shuffles to perform in the shuffle test, by default 1000.
     """
     n_bin = 45
     n_speed_bin = 6
     speed_range = (2, 8)
     speed_smooth_win = 5
-    n_map = 2#2
-    map_ids = [4,5]#[2, 4]
+    n_map = 1#2
+    map_ids = [4]#[2, 4]
     exclude_prefix = 100
     
     assert n_map == len(map_ids), "n_map should be the same as the length of map_ids."
@@ -335,28 +583,36 @@ def run_LinearTrack1D(
         
     print("      c. Save the processed data.")
     print("  4. Shuffle test for spatial tuning.")
-    idx = np.where(np.diff(trace['ms_trial']) != 0)[0] + 1
-    trial_bound = np.zeros((idx.shape[0]+1, 2), dtype=np.int32)
-    trial_bound[0, 0] = 0
-    trial_bound[-1, 1] = trace['ms_trial'].shape[0]
-    trial_bound[1:, 0] = idx
-    trial_bound[:-1, 1] = idx
-    
     p_values_all = np.zeros((trace['n_neuron'], n_map), dtype=np.float64)
     ptp_all = np.zeros((trace['n_neuron'], n_map), dtype=np.float64)
-    shuf_ptp_all = np.zeros((trace['n_neuron'], n_map, 1000), dtype=np.float64)
+    shuf_ptp_all = np.zeros(
+        (trace['n_neuron'], n_map, n_shuffle),
+        dtype=np.float64,
+    )
+
     for n in range(n_map):
         print(f"      Map {map_ids[n]}:")
-        idx = np.where(trace['ms_map'][exclude_prefix:] == map_ids[n])[0]+exclude_prefix
-        p_values, ptp, shuf_ptp = shuffle_test(
+
+        idx = np.where(trace['ms_map'][exclude_prefix:] == map_ids[n])[0] + exclude_prefix
+
+        included_cells = np.where(trace['snr'] >= 0.5)[0]
+
+        # Local trial boundaries after subsetting by idx.
+        local_trial_bound = make_local_trial_bound_from_trial_ids(
+            trace['ms_trial'][idx]
+        )
+
+        p_values, ptp, shuf_ptp = shuffle_test_parallel(
             dFF=trace['RawTraces'][:, idx],
             stim=trace['spike_nodes'][idx],
             n_bins=trace['rate_map_all'].shape[1],
-            trial_bound=trial_bound,
-            n_shuffles=1000,
+            trial_bound=local_trial_bound,
+            n_shuffles=n_shuffle,
             seed=42,
-            included_cells=np.where(trace['snr'] >= 0.5)[0]
+            included_cells=included_cells,
+            n_workers=10
         )
+
         p_values_all[:, n] = p_values
         ptp_all[:, n] = ptp
         shuf_ptp_all[:, n, :] = shuf_ptp
@@ -371,12 +627,26 @@ def run_LinearTrack1D(
     print("  5. Calculate mutual information.")
     MI = np.zeros((trace['RawTraces'].shape[0], n_map), np.float32)
     map_idx = [np.where(trace['ms_map'][exclude_prefix:] == map_ids[n])[0]+exclude_prefix for n in range(n_map)]
-    for i in tqdm(range(trace['RawTraces'].shape[0])):
-        for n in range(n_map):
-            MI[i, n] = mutual_info_regression(
-                trace['RawTraces'][i, map_idx[n]].reshape(-1, 1), 
-                trace['spike_nodes'][map_idx[n]]
-            )[0]
+    for n in range(n_map):
+        print(f"      Map {map_ids[n]}:")
+
+        idx = map_idx[n]
+
+        # X: rows are time points, columns are neurons.
+        # Each column/neuron gets one MI value against y.
+        X = np.ascontiguousarray(trace['RawTraces'][:, idx].T, dtype=np.float64)
+        y = np.asarray(trace['spike_nodes'][idx], dtype=np.float64)
+
+        mi_this_map = mutual_info_regression(
+            X,
+            y,
+            discrete_features=False,
+            n_neighbors=3,
+            random_state=42,
+            n_jobs=10,
+        )
+
+        MI[:, n] = mi_this_map.astype(np.float32)
     trace['mutual_info'] = MI
     with open(os.path.join(save_dir, f"trace.pkl"), 'wb') as f:
         pickle.dump(trace, f)
@@ -386,10 +656,10 @@ def run_LinearTrack1D(
 
 if __name__ == "__main__":
     info = {
-        "FishID": ["10162"],
+        "FishID": ["10138"],
         "session": [2],
-        "suite2p_dir": [r"D:\EnData\Light-sheet\10162\snr filtered"],
-        "behav_dir": [r"D:\EnData\Light-sheet\spatial preference vr1\10162\S2\res.16chFlt"]
+        "suite2p_dir": [r"D:\EnData\Light-sheet\10138\snr filtered"],
+        "behav_dir": [r"D:\EnData\Light-sheet\10138\S3\res.16chFlt"]
     }
     sheet_file = pd.DataFrame(info)
     for i in range(len(sheet_file)):

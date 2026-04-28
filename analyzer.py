@@ -144,7 +144,7 @@ def shuffle_test(
         shuf_ptp[:, i] = np.ptp(shuf_responses, axis=1)
         
     
-    p_values = np.mean(shuf_ptp - ptp[included_cells, np.newaxis], axis=1)
+    p_values = np.mean(shuf_ptp >= ptp[included_cells, np.newaxis], axis=1)
     p_values_return = np.ones(dFF.shape[0]) * np.nan
     p_values_return[included_cells] = p_values
     
