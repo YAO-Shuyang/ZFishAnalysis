@@ -610,7 +610,7 @@ def run_LinearTrack1D(
             n_shuffles=n_shuffle,
             seed=42,
             included_cells=included_cells,
-            n_workers=10
+            n_workers=5
         )
 
         p_values_all[:, n] = p_values
