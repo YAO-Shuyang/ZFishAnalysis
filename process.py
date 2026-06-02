@@ -298,8 +298,8 @@ def run_LinearTrack1D(
     n_speed_bin = 6
     speed_range = (2, 8)
     speed_smooth_win = 5
-    n_map = 1#2
-    map_ids = [4]#[2, 4]
+    n_map = 2#2
+    map_ids = [4, 5]#[2, 4]
     exclude_prefix = 100
     
     assert n_map == len(map_ids), "n_map should be the same as the length of map_ids."
@@ -317,6 +317,8 @@ def run_LinearTrack1D(
     print("      a. Suite2p data imported.")
     res = import16chFlt(behav_dir, 21)
     print("      b. 16chFlt behavioral data imported.")
+    print(f"Detect Map(s): {np.unique(res['map'])}")
+    assert len(np.unique(res['map'])) >= n_map, "The number of unique maps in the behavioral data should be at least n_map."
     save_dir = os.path.dirname(behav_dir)
     processed_file = os.path.join(save_dir, "process")
     os.makedirs(processed_file, exist_ok=True)
@@ -583,36 +585,28 @@ def run_LinearTrack1D(
         
     print("      c. Save the processed data.")
     print("  4. Shuffle test for spatial tuning.")
+    idx = np.where(np.diff(trace['ms_trial']) != 0)[0] + 1
+    trial_bound = np.zeros((idx.shape[0]+1, 2), dtype=np.int32)
+    trial_bound[0, 0] = 0
+    trial_bound[-1, 1] = trace['ms_trial'].shape[0]
+    trial_bound[1:, 0] = idx
+    trial_bound[:-1, 1] = idx
+    
     p_values_all = np.zeros((trace['n_neuron'], n_map), dtype=np.float64)
     ptp_all = np.zeros((trace['n_neuron'], n_map), dtype=np.float64)
-    shuf_ptp_all = np.zeros(
-        (trace['n_neuron'], n_map, n_shuffle),
-        dtype=np.float64,
-    )
-
+    shuf_ptp_all = np.zeros((trace['n_neuron'], n_map, 1000), dtype=np.float64)
     for n in range(n_map):
         print(f"      Map {map_ids[n]}:")
-
-        idx = np.where(trace['ms_map'][exclude_prefix:] == map_ids[n])[0] + exclude_prefix
-
-        included_cells = np.where(trace['snr'] >= 0.5)[0]
-
-        # Local trial boundaries after subsetting by idx.
-        local_trial_bound = make_local_trial_bound_from_trial_ids(
-            trace['ms_trial'][idx]
-        )
-
-        p_values, ptp, shuf_ptp = shuffle_test_parallel(
+        idx = np.where(trace['ms_map'][exclude_prefix:] == map_ids[n])[0]+exclude_prefix
+        p_values, ptp, shuf_ptp = shuffle_test(
             dFF=trace['RawTraces'][:, idx],
             stim=trace['spike_nodes'][idx],
             n_bins=trace['rate_map_all'].shape[1],
-            trial_bound=local_trial_bound,
-            n_shuffles=n_shuffle,
+            trial_bound=trial_bound,
+            n_shuffles=1000,
             seed=42,
-            included_cells=included_cells,
-            n_workers=5
+            included_cells=np.where(trace['snr'] >= 0.5)[0]
         )
-
         p_values_all[:, n] = p_values
         ptp_all[:, n] = ptp
         shuf_ptp_all[:, n, :] = shuf_ptp
@@ -627,26 +621,12 @@ def run_LinearTrack1D(
     print("  5. Calculate mutual information.")
     MI = np.zeros((trace['RawTraces'].shape[0], n_map), np.float32)
     map_idx = [np.where(trace['ms_map'][exclude_prefix:] == map_ids[n])[0]+exclude_prefix for n in range(n_map)]
-    for n in range(n_map):
-        print(f"      Map {map_ids[n]}:")
-
-        idx = map_idx[n]
-
-        # X: rows are time points, columns are neurons.
-        # Each column/neuron gets one MI value against y.
-        X = np.ascontiguousarray(trace['RawTraces'][:, idx].T, dtype=np.float64)
-        y = np.asarray(trace['spike_nodes'][idx], dtype=np.float64)
-
-        mi_this_map = mutual_info_regression(
-            X,
-            y,
-            discrete_features=False,
-            n_neighbors=3,
-            random_state=42,
-            n_jobs=10,
-        )
-
-        MI[:, n] = mi_this_map.astype(np.float32)
+    for i in tqdm(range(trace['RawTraces'].shape[0])):
+        for n in range(n_map):
+            MI[i, n] = mutual_info_regression(
+                trace['RawTraces'][i, map_idx[n]].reshape(-1, 1), 
+                trace['spike_nodes'][map_idx[n]]
+            )[0]
     trace['mutual_info'] = MI
     with open(os.path.join(save_dir, f"trace.pkl"), 'wb') as f:
         pickle.dump(trace, f)
@@ -656,10 +636,10 @@ def run_LinearTrack1D(
 
 if __name__ == "__main__":
     info = {
-        "FishID": ["10138"],
+        "FishID": ["10175"],
         "session": [2],
-        "suite2p_dir": [r"D:\EnData\Light-sheet\10138\snr filtered"],
-        "behav_dir": [r"D:\EnData\Light-sheet\10138\S3\res.16chFlt"]
+        "suite2p_dir": [r"D:\EnData\Light-sheet\10175\snr filtered"],
+        "behav_dir": [r"D:\EnData\Light-sheet\spatial preference vr1\10175\S2\res.16chFlt"]
     }
     sheet_file = pd.DataFrame(info)
     for i in range(len(sheet_file)):
