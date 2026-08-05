@@ -199,7 +199,13 @@ class SimpleViewer(QWidget):
             data = import12chFlt(path)
         elif ext == ".16chflt":
             from zfish._io import import16chFlt
-            data = import16chFlt(path)
+            try:
+                data = import16chFlt(path)
+            except:
+                try: 
+                    data = import16chFlt(path, nchannel=16)
+                except:
+                    pass
         else:
             data = import10ch(path)
         if not isinstance(data, dict):

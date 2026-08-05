@@ -292,7 +292,12 @@ def import16chFlt(filename: str, nchannel: int=21) -> SwimDataDict:
         data['map'] = A[20, :].astype(np.int64)
     except:
         pass
-        
+    
+    try: 
+        data['estDir'] = A[21, :].astype(np.float64)
+    except:
+        pass
+    
     data = SwimDataDict(data, extension='.16chFlt')
     
     return data
