@@ -298,6 +298,20 @@ def import16chFlt(filename: str, nchannel: int=21) -> SwimDataDict:
     except:
         pass
     
+    try:
+        data['swirl_angular_change'] = A[22, :].astype(np.float64)
+        data['swirl_radial'] = A[23, :].astype(np.float64)
+        data['n_swirls'] = A[24, :].astype(np.int64)
+    except:
+        pass
+    
+    try:
+        data['displacementX'] = A[25, :].astype(np.float64)
+        data['displacementY'] = A[26, :].astype(np.float64)
+        data['n_displacements'] = A[27, :].astype(np.int64)
+    except:
+        pass
+    
     data = SwimDataDict(data, extension='.16chFlt')
     
     return data
