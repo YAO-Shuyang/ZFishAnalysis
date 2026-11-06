@@ -6,5 +6,6 @@ f_formal = pd.read_excel(r"D:\EnData\Experiment Records.xlsx", sheet_name="forma
 f_dao_opt = pd.read_excel(r"D:\EnData\Experiment Records.xlsx", sheet_name="light_driven_exp")
 figpath = r"D:\Yao Shuyang\En Lab\Results"
 figdata = r"D:\Yao Shuyang\En Lab\Results\FigData"
+landmark_dir = os.path.join(os.path.dirname(__file__), "landmarks", "Landmarks.png")
 
 

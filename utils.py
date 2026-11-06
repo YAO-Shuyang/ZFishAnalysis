@@ -273,8 +273,9 @@ def get_meanImg(trace: dict):
 
     Returns
     -------
-    np.ndarray
+    np.ndarray, np.ndarray
         The mean image of the input trace.
+        The readjusted ROI coordinates.
     """
     if 'meanImg' not in trace:
         raise KeyError('The input trace does not contain "meanImg" field!')

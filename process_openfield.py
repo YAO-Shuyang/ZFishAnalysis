@@ -1,657 +1,859 @@
-"""Open-field spatial tuning analysis for Suite2p + .16chFlt recordings.
+"""Position and head-direction tuning from Suite2p and 28-channel behavior.
 
-The pipeline is intentionally staged:
-1. import and align data;
-2. compute and save 2-D tuning maps immediately;
-3. compute and save spatial metrics;
-4. optionally compute temporal-shuffle null distributions.
+Run: python process_openfield.py SUITE2P_DIR BEHAV_FILE --speed-threshold 1
+Or call run_OpenField2D(i, sheet_file, ...), using the original spreadsheet IO.
+Times are seconds; coordinates are task units, so speed is task units/second.
+The two recording clocks must be synchronized. Supply frame_times for measured
+imaging timestamps, or imaging_time_offset when using a regular sampling clock.
 
-Designed for paradigm 20251102 and meaningful x/y coordinates in [35, 65].
+Signed dF/F is retained. Skaggs-form information uses max(dF/F, 0), separately
+from signed tuning, and is a descriptive calcium-response score. Optional
+circular-shift tests report per-cell p-values and 95th-percentile flags, plus
+Benjamini-Hochberg q-values across position and HD.
+
+Large outputs are backed by .npy files in openfield_arrays/. trace.pkl embeds
+ordinary NumPy arrays (not external-path references) and is self-contained.
+Loading it consequently requires RAM for those arrays. Import-time memory use
+is determined by the user's import_suite2p/import16chFlt implementations.
 """
-
 from __future__ import annotations
 
+import argparse
 import os
 import pickle
-import time
-from pathlib import Path
-from typing import Iterable
-
-import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
-import tifffile as tiff
-from scipy import sparse
-from scipy.ndimage import gaussian_filter
+import time as ttt
 from tqdm import tqdm
+from pathlib import Path
+
+import numpy as np
+from scipy import sparse
+from scipy.ndimage import (gaussian_filter, gaussian_filter1d, maximum_filter1d,
+                           minimum_filter1d, percentile_filter, uniform_filter1d)
 
 from zfish._io import import_suite2p, import16chFlt
-from mazepy.basic.conversion import coordinate_recording_time
 
 
-EXPECTED_PARADIGM = 20251102
-POSITION_RANGE = (35.0, 65.0)
-N_BINS_X = 15
-N_BINS_Y = 15
+def compute_dff(raw_f, fneu, fs, output_path, *, start_frame=0,
+                neuropil_coeff=0.7, baseline_method="maximin",
+                baseline_window_seconds=60.0, baseline_percentile=20.0,
+                baseline_sigma_seconds=1.0, baseline_min=1e-6, chunk_size=256):
+    """Compute signed dF/F in neuron blocks, writing a disk-backed array.
 
+    Parameters
+    ----------
+    raw_f, fneu : array_like, shape (n_neuron, n_frame)
+        ROI and neuropil fluorescence from the user's Suite2p importer.
+    fs : float
+        Imaging sampling rate per plane, in Hz.
+    output_path : str or pathlib.Path
+        Destination .npy file for dF/F.
+    start_frame : int, optional
+        Discard earlier frames before baseline estimation.
+    neuropil_coeff : float, optional
+        Coefficient in Fc = F - neuropil_coeff * Fneu.
+    baseline_method : {'maximin', 'percentile', 'rolling_percentile'}, optional
+        Maximin applies Gaussian smoothing, running minimum, then maximum.
+        Percentile is constant across the retained session. Rolling percentile
+        is slower and intended for explicit sensitivity checks.
+    baseline_window_seconds, baseline_sigma_seconds : float, optional
+        Baseline window and Gaussian standard deviation, in seconds.
+    baseline_percentile : float, optional
+        Percentile used by either percentile method.
+    baseline_min : float, optional
+        Baselines at or below this value invalidate the ROI, without flooring.
+    chunk_size : int, optional
+        Maximum neurons processed simultaneously.
 
-def _atomic_pickle_dump(obj: object, path: str | Path) -> None:
-    """Write a pickle atomically to reduce the chance of a corrupted checkpoint."""
-    path = Path(path)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp_path, "wb") as f:
-        pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
-    os.replace(tmp_path, path)
-
-
-def _save_trace(trace: dict, save_dir: str | Path, stage: str) -> Path:
-    """Checkpoint trace.pkl and record the completed stage."""
-    save_dir = Path(save_dir)
-    trace["processing_stage"] = stage
-    trace["last_saved"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    path = save_dir / "trace.pkl"
-    _atomic_pickle_dump(trace, path)
-    print(f"Saved checkpoint ({stage}): {path}")
-    return path
-
-
-def compute_nonnegative_dff(
-    raw_f: np.ndarray,
-    fneu: np.ndarray,
-    neuropil_coeff: float = 0.7,
-    baseline_percentile: float = 20.0,
-    cell_chunk_size: int = 2048,
-    eps: float = 1e-6,
-) -> np.ndarray:
-    """Compute nonnegative dF/F from Suite2p fluorescence.
-
-    F_corrected = F - neuropil_coeff * Fneu
-    F0 is the temporal percentile of F_corrected for each ROI.
-    dF/F values below zero are rectified to zero.
+    Returns
+    -------
+    dff : numpy.memmap, shape (n_neuron, n_retained_frame)
+        Signed dF/F; invalid ROIs contain NaN.
+    valid_roi : ndarray of bool, shape (n_neuron,)
+        True when all retained fluorescence and baseline values are valid.
+    baseline_summary : ndarray, shape (n_neuron, 3)
+        Minimum, median, and maximum F0; invalid ROIs contain NaN.
 
     Notes
     -----
-    Rectification is used because downstream spatial-information calculations
-    require nonnegative responses. The unrectified corrected fluorescence and
-    baseline are not retained to avoid duplicating very large arrays.
+    A conservative whole-ROI exclusion avoids silently imputing missing data
+    or making occupancy probabilities depend on a neuron's missing samples.
     """
-    raw_f = np.asarray(raw_f, dtype=np.float32)
-    fneu = np.asarray(fneu, dtype=np.float32)
-    if raw_f.shape != fneu.shape:
-        raise ValueError(f"F and Fneu shape mismatch: {raw_f.shape} vs {fneu.shape}")
-
-    dff = np.empty_like(raw_f, dtype=np.float32)
-    n_cells = raw_f.shape[0]
-
-    for start in tqdm(range(0, n_cells, cell_chunk_size), desc="Computing dF/F"):
-        stop = min(start + cell_chunk_size, n_cells)
-        corrected = raw_f[start:stop] - neuropil_coeff * fneu[start:stop]
-        f0 = np.nanpercentile(corrected, baseline_percentile, axis=1).astype(np.float32)
-
-        # A nonpositive F0 makes a fluorescence ratio undefined. Use a small,
-        # data-scaled positive floor rather than dividing by zero/negative values.
-        positive = corrected[corrected > 0]
-        data_floor = np.nanpercentile(positive, 1) if positive.size else eps
-        f0 = np.maximum(f0, max(float(data_floor), eps))
-
-        block = (corrected - f0[:, None]) / f0[:, None]
-        np.maximum(block, 0.0, out=block)
-        block[~np.isfinite(block)] = 0.0
-        dff[start:stop] = block.astype(np.float32, copy=False)
-
-    return dff
-
-
-def positions_to_nodes(
-    xpos: np.ndarray,
-    ypos: np.ndarray,
-    position_range: tuple[float, float] = POSITION_RANGE,
-    n_bins_x: int = N_BINS_X,
-    n_bins_y: int = N_BINS_Y,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Select valid open-field samples and convert x/y positions to 2-D bins."""
-    xpos = np.asarray(xpos, dtype=np.float64)
-    ypos = np.asarray(ypos, dtype=np.float64)
-    lo, hi = position_range
-
-    valid = np.where(
-        np.isfinite(xpos)
-        & np.isfinite(ypos)
-        & (xpos >= lo)
-        & (xpos <= hi)
-        & (ypos >= lo)
-        & (ypos <= hi)
-    )[0]
-    if valid.size == 0:
-        raise ValueError(f"No x/y samples fall inside [{lo}, {hi}] on both axes.")
-
-    # Coordinates 35..65 span 30 units. Values exactly at 65 are assigned to
-    # the last bin rather than producing index 30.
-    xbin = np.floor((xpos[valid] - lo) / (hi - lo) * n_bins_x).astype(np.int32)
-    ybin = np.floor((ypos[valid] - lo) / (hi - lo) * n_bins_y).astype(np.int32)
-    xbin = np.clip(xbin, 0, n_bins_x - 1)
-    ybin = np.clip(ybin, 0, n_bins_y - 1)
-    nodes = ybin * n_bins_x + xbin
-    return valid, nodes.astype(np.int32), np.column_stack([xbin, ybin]).astype(np.int16)
+    if raw_f.ndim != 2 or raw_f.shape != fneu.shape:
+        raise ValueError("RawTraces and Fneu must have the same 2-D shape.")
+    if baseline_method not in {"maximin", "percentile", "rolling_percentile"}:
+        raise ValueError("Unknown baseline_method.")
+    if (not np.isfinite(fs) or fs <= 0 or chunk_size < 1 or
+            not 0 <= start_frame < raw_f.shape[1] or
+            baseline_window_seconds <= 0 or baseline_sigma_seconds < 0 or
+            not 0 <= baseline_percentile <= 100 or baseline_min <= 0 or
+            not np.isfinite(neuropil_coeff) or neuropil_coeff < 0):
+        raise ValueError("Invalid dF/F parameters.")
+    shape = (raw_f.shape[0], raw_f.shape[1] - start_frame)
+    dff = np.lib.format.open_memmap(output_path, mode="w+", dtype="float32", shape=shape)
+    valid_roi = np.zeros(shape[0], dtype=bool)
+    summary = np.full((shape[0], 3), np.nan, dtype=np.float32)
+    window = max(1, round(baseline_window_seconds * fs))
+    sigma = baseline_sigma_seconds * fs
+    for start in tqdm(range(0, shape[0], chunk_size), desc="dF/F computation"):
+        stop = min(start + chunk_size, shape[0])
+        fc = np.array(raw_f[start:stop, start_frame:], dtype=np.float32, copy=True)
+        fc -= neuropil_coeff * np.asarray(fneu[start:stop, start_frame:], dtype=np.float32)
+        finite = np.isfinite(fc).all(axis=1)
+        fc[~finite] = 0  # Excluded rows must not contaminate filtering operations.
+        if baseline_method == "percentile":
+            f0 = np.percentile(fc, baseline_percentile, axis=1)[:, None]
+        elif baseline_method == "rolling_percentile":
+            f0 = percentile_filter(fc, baseline_percentile, size=(1, window), mode="reflect")
+        else:
+            f0 = gaussian_filter1d(fc, sigma, axis=1, mode="reflect") if sigma else fc.copy()
+            f0 = minimum_filter1d(f0, window, axis=1, mode="reflect")
+            f0 = maximum_filter1d(f0, window, axis=1, mode="reflect")
+        valid = finite & np.isfinite(f0).all(axis=1) & (f0 > baseline_min).all(axis=1)
+        block = np.full_like(fc, np.nan)
+        with np.errstate(over="ignore", invalid="ignore"):
+            block[valid] = (fc[valid] - f0[valid]) / f0[valid]
+        valid &= np.isfinite(block).all(axis=1)
+        block[~valid] = np.nan
+        dff[start:stop] = block
+        valid_roi[start:stop] = valid
+        summary[start:stop][valid] = np.column_stack(
+            (f0[valid].min(axis=1), np.median(f0[valid], axis=1), f0[valid].max(axis=1)))
+    dff.flush()
+    return dff, valid_roi, summary
 
 
-def _node_design_matrix(nodes: np.ndarray, n_spatial_bins: int) -> sparse.csr_matrix:
-    rows = np.arange(nodes.size, dtype=np.int64)
-    data = np.ones(nodes.size, dtype=np.float32)
-    return sparse.csr_matrix((data, (rows, nodes)), shape=(nodes.size, n_spatial_bins))
+def tuning_metrics(first, second, positive_map, occupancy):
+    """Compute vectorized Pearson stability and Skaggs-form information.
 
+    Parameters
+    ----------
+    first, second : ndarray, shape (n_neuron, n_bin)
+        Signed tuning curves in chronological session halves. NaN marks bins
+        below the occupancy threshold; correlation uses common finite bins.
+    positive_map : ndarray, shape (n_neuron, n_bin)
+        Means of framewise rectified dF/F, not rectified signed bin means.
+    occupancy : ndarray, shape (n_bin,)
+        Time in seconds in each bin for the complete analyzed session.
 
-def compute_2d_response_map(
-    activity: np.ndarray,
-    nodes: np.ndarray,
-    n_bins_x: int = N_BINS_X,
-    n_bins_y: int = N_BINS_Y,
-    min_occupancy_samples: int = 1,
-    cell_chunk_size: int = 1024,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Compute mean activity in each spatial bin using sparse matrix products."""
-    activity = np.asarray(activity, dtype=np.float32)
-    nodes = np.asarray(nodes, dtype=np.int32)
-    if activity.ndim != 2 or activity.shape[1] != nodes.size:
-        raise ValueError("activity must be (n_cells, n_time) and match nodes length")
-
-    n_spatial_bins = n_bins_x * n_bins_y
-    design = _node_design_matrix(nodes, n_spatial_bins)
-    occupancy = np.asarray(design.sum(axis=0)).ravel().astype(np.int64)
-
-    maps = np.full((activity.shape[0], n_spatial_bins), np.nan, dtype=np.float32)
-    valid_bins = occupancy >= min_occupancy_samples
-
-    for start in tqdm(range(0, activity.shape[0], cell_chunk_size), desc="2-D tuning maps"):
-        stop = min(start + cell_chunk_size, activity.shape[0])
-        sums = np.asarray(design.T @ activity[start:stop].T, dtype=np.float32).T
-        block = np.full_like(sums, np.nan, dtype=np.float32)
-        block[:, valid_bins] = sums[:, valid_bins] / occupancy[valid_bins][None, :]
-        maps[start:stop] = block
-
-    return maps.reshape(activity.shape[0], n_bins_y, n_bins_x), occupancy.reshape(n_bins_y, n_bins_x)
-
-
-def smooth_2d_maps(
-    maps: np.ndarray,
-    sigma_bins: float = 1.0
-) -> np.ndarray:
-    """Occupancy-mask-normalized Gaussian smoothing without filling unvisited bins."""
-    maps = np.asarray(maps, dtype=np.float32).reshape(maps.shape[0], N_BINS_Y * N_BINS_X)
-    maps[np.isnan(maps)] = 0
-    
-    y_bin, x_bin = np.meshgrid(
-        np.arange(N_BINS_Y),
-        np.arange(N_BINS_X),
-        indexing="ij",
-    )
-
-    coords = np.column_stack([
-        x_bin.ravel(),
-        y_bin.ravel(),
-    ]).astype(np.float32)
-    displacement = coords[:, None, :] - coords[None, :, :]
-    dist_mat = np.sqrt(
-        np.sum(displacement**2, axis=2)
-    )
-    
-    to_center_displacement = (coords - np.array([[ (N_BINS_X-1) / 2, (N_BINS_Y-1) / 2 ]]))
-    to_center_dist = np.sqrt(np.sum(to_center_displacement**2, axis=1))
-    mask = to_center_dist > (N_BINS_X+1)/2
-    
-    kernel = np.exp(-0.5 * (dist_mat / sigma_bins) ** 2)
-    for j in range(kernel.shape[1]):
-        kernel[:, j] /= np.sum(kernel[:, j])
-        
-    smoothed = maps @ kernel
-    smoothed[:, mask] = np.nan
-    
-    return smoothed
-
-def smooth_1dloop_maps(
-    maps: np.ndarray,
-    sigma_bins: float = 1.0
-) -> np.ndarray:
-    """Occupancy-mask-normalized Gaussian smoothing for 1-D head-direction maps."""
-    maps = np.asarray(maps, dtype=np.float32)
-    maps[np.isnan(maps)] = 0
-    n_bins = maps.shape[1]
-    dist = np.zeros((n_bins, n_bins), dtype=np.float32)
-    for i in range(n_bins):
-        for j in range(n_bins):
-            d = abs(i - j)
-            dist[i, j] = min(d, n_bins - d)
-    kernel = np.exp(-0.5 * (dist / sigma_bins) ** 2)
-    for j in range(kernel.shape[1]):
-        kernel[:, j] /= np.sum(kernel[:, j])
-
-    smoothed = maps @ kernel
-    return smoothed
-
-
-def split_half_correlation(first_maps: np.ndarray, second_maps: np.ndarray) -> np.ndarray:
-    """Per-cell Pearson correlation across bins visited in both halves."""
-    n_cells = first_maps.shape[0]
-    corr = np.full(n_cells, np.nan, dtype=np.float32)
-    a = first_maps.reshape(n_cells, -1)
-    b = second_maps.reshape(n_cells, -1)
-
-    for i in tqdm(range(n_cells), desc="Split-half reliability"):
-        valid = np.isfinite(a[i]) & np.isfinite(b[i])
-        if valid.sum() < 3:
-            continue
-        av = a[i, valid]
-        bv = b[i, valid]
-        if np.std(av) == 0 or np.std(bv) == 0:
-            continue
-        corr[i] = np.corrcoef(av, bv)[0, 1]
-    return corr
-
-
-def spatial_information(
-    rate_maps: np.ndarray,
-    occupancy: np.ndarray,
-) -> np.ndarray:
-    """Compute occupancy-weighted spatial information for nonnegative responses.
-
-    This uses the standard information form sum_i p_i * (r_i/r_bar) *
-    log2(r_i/r_bar). For calcium fluorescence, the result is best interpreted
-    as bits per unit mean fluorescence response rather than bits per spike.
+    Returns
+    -------
+    correlation, information : ndarray, shape (n_neuron,)
+        Pearson r and sum(p * q * log2(q)), q = response/mean_response.
+        Zero variance, fewer than three common bins, or zero total response
+        yields NaN. Occupancy is renormalized over eligible bins.
     """
-    flat_maps = np.asarray(rate_maps, dtype=np.float64).reshape(rate_maps.shape[0], -1)
-    occ = np.asarray(occupancy, dtype=np.float64).ravel()
-    visited = (occ > 0) & np.any(np.isfinite(flat_maps), axis=0)
-    p = occ[visited] / np.sum(occ[visited])
-    response = flat_maps[:, visited]
-
-    if np.nanmin(response) < 0:
-        raise ValueError("Spatial information requires nonnegative response maps.")
-
-    mean_response = np.nansum(response * p[None, :], axis=1)
-    ratio = np.divide(
-        response,
-        mean_response[:, None],
-        out=np.zeros_like(response),
-        where=mean_response[:, None] > 0,
-    )
-    term = np.zeros_like(ratio)
-    positive = ratio > 0
-    term[positive] = ratio[positive] * np.log2(ratio[positive])
-    return np.nansum(term * p[None, :], axis=1).astype(np.float32)
+    common = np.isfinite(first) & np.isfinite(second)
+    count = common.sum(axis=1, keepdims=True)
+    a = np.where(common, first, 0).astype(np.float64)
+    b = np.where(common, second, 0).astype(np.float64)
+    a -= a.sum(axis=1, keepdims=True) / np.maximum(count, 1)
+    b -= b.sum(axis=1, keepdims=True) / np.maximum(count, 1)
+    a[~common] = 0
+    b[~common] = 0
+    denominator = np.sqrt(np.sum(a*a, axis=1) * np.sum(b*b, axis=1))
+    correlation = np.full(first.shape[0], np.nan)
+    np.divide(np.sum(a*b, axis=1), denominator, out=correlation,
+              where=(count[:, 0] >= 3) & (denominator > 0))
+    correlation = np.clip(correlation, -1, 1)
+    return correlation.astype(np.float32), information_score(positive_map, occupancy)
 
 
-def compute_temporal_shuffle_distributions(
-    activity: np.ndarray,
-    nodes: np.ndarray,
-    occupancy: np.ndarray,
-    output_dir: str | Path,
-    n_shuffles: int = 1000,
-    min_shift_seconds: float = 10.0,
-    fs: float = 5.0,
-    cell_chunk_size: int = 512,
-    seed: int = 42,
-) -> dict:
-    """Generate temporal-shuffle null distributions for PTP and spatial information.
+def information_score(response, occupancy, *, zero_value=np.nan):
+    """Compute occupancy-weighted Skaggs-form information for positive activity.
 
-    A single random circular displacement is applied to the continuous neural
-    activity relative to the behavioral trajectory for each shuffle. Raw null
-    arrays are stored as .npy memmaps to avoid inflating trace.pkl.
+    Parameters
+    ----------
+    response : ndarray, shape (n_neuron, n_bin)
+        Nonnegative bin means; NaN bins are excluded.
+    occupancy : ndarray, shape (n_bin,)
+        Sampled duration in seconds, renormalized over finite bins per neuron.
+    zero_value : float, optional
+        Score assigned when total response is zero. Observed silent neurons
+        are untestable (NaN); silent shuffled samples receive zero information
+        so they remain in the null distribution instead of being discarded.
+
+    Returns
+    -------
+    information : ndarray, shape (n_neuron,)
+        Sum p_i * (r_i/r_mean) * log2(r_i/r_mean), using 0*log(0) = 0.
     """
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    n_cells, n_time = activity.shape
-    n_bins_y, n_bins_x = occupancy.shape
-    n_spatial_bins = n_bins_x * n_bins_y
-    design = _node_design_matrix(nodes, n_spatial_bins)
-    occ_flat = occupancy.ravel().astype(np.int64)
-    valid_bins = occ_flat > 0
-    p = occ_flat[valid_bins] / occ_flat[valid_bins].sum()
+    eligible = np.isfinite(response) & (occupancy[None, :] > 0)
+    p = np.where(eligible, occupancy[None, :], 0).astype(np.float64)
+    np.divide(p, p.sum(axis=1, keepdims=True), out=p,
+              where=p.sum(axis=1, keepdims=True) > 0)
+    response = np.where(eligible, response, 0).astype(np.float64)
+    if np.any(response < 0):
+        raise ValueError("Information requires nonnegative responses.")
+    mean = np.sum(p * response, axis=1, keepdims=True)
+    ratio = np.zeros_like(response)
+    np.divide(response, mean, out=ratio, where=mean > 0)
+    log_ratio = np.zeros_like(ratio)
+    np.log2(ratio, out=log_ratio, where=ratio > 0)
+    information = np.maximum(0, np.sum(p * ratio * log_ratio, axis=1))
+    information[mean[:, 0] <= 0] = zero_value
+    return information.astype(np.float32)
 
-    min_shift = max(1, int(round(min_shift_seconds * fs)))
-    if n_time <= 2 * min_shift:
-        raise ValueError("Recording is too short for the requested minimum shuffle displacement.")
 
-    ptp_path = output_dir / "shuffle_ptp.npy"
-    si_path = output_dir / "shuffle_spatial_information.npy"
-    shifts_path = output_dir / "shuffle_temporal_offsets.npy"
-    ptp_null = np.lib.format.open_memmap(ptp_path, mode="w+", dtype=np.float32, shape=(n_cells, n_shuffles))
-    si_null = np.lib.format.open_memmap(si_path, mode="w+", dtype=np.float32, shape=(n_cells, n_shuffles))
+def compute_tuning(dff, frame_idx, bins, frame_seconds, first_half, valid_roi,
+                   bin_shape, output_dir, label, *, chunk_size=256,
+                   min_occupancy_seconds=1.0, smoothing_sigma_bins=1.0,
+                   save_half_maps=False):
+    """Aggregate spatial or circular HD tuning with sparse matrix products.
 
+    Parameters
+    ----------
+    dff : ndarray, shape (n_neuron, n_frame)
+        Signed fluorescence response.
+    frame_idx, bins : ndarray, shape (n_selected_frame,)
+        Indices into dff and zero-based bin assignments.
+    frame_seconds : ndarray, shape (n_selected_frame,)
+        Imaging-frame duration weights; removed intervals add no occupancy.
+    first_half : ndarray of bool, shape (n_selected_frame,)
+        Membership in the first chronological half before speed filtering.
+    valid_roi : ndarray of bool, shape (n_neuron,)
+        ROIs eligible for analysis.
+    bin_shape : tuple of int
+        (n_y, n_x) for space or (n_hd,) for circular heading.
+    output_dir : pathlib.Path
+        Destination directory for disk-backed maps.
+    label : str
+        Prefix for output array filenames.
+    chunk_size : int, optional
+        Neurons per block; avoids a full filtered neural-array copy.
+    min_occupancy_seconds : float, optional
+        Minimum sampled time required per bin, independently in each half.
+    smoothing_sigma_bins : float, optional
+        Gaussian width. Zero disables smoothing. Sums and occupancy are
+        smoothed separately; originally ineligible bins remain NaN.
+    save_half_maps : bool, optional
+        Also retain raw/smoothed half maps; otherwise save only half metrics.
+
+    Returns
+    -------
+    result : dict
+        Raw/smoothed signed and positive session tuning, occupancy seconds and
+        counts (session and halves), and raw/smoothed split-half correlations.
+        All tuning arrays have shape (n_neuron, n_bin). Spatial bin order is
+        y * n_x + x. Information uses unsmoothed positive tuning.
+    """
+    n_neuron, n_bin = dff.shape[0], int(np.prod(bin_shape))
+    selectors = [np.ones(bins.size, bool), first_half, ~first_half]
+    designs, occupancy, counts = [], [], []
+    for select in selectors:
+        weights = np.where(select, frame_seconds, 0)
+        designs.append(sparse.csr_matrix((weights, (bins, np.arange(bins.size))),
+                                        shape=(n_bin, bins.size)))
+        occupancy.append(np.bincount(bins, weights=weights, minlength=n_bin))
+        counts.append(np.bincount(bins[select], minlength=n_bin))
+    result = {"occupancy_seconds": np.array(occupancy), "occupancy_samples": np.array(counts)}
+    keys = ["tuning_raw", "tuning_smooth", "positive_tuning_raw"]
+    if save_half_maps:
+        keys += ["first_raw", "second_raw", "first_smooth", "second_smooth"]
+    for key in keys:
+        result[key] = np.lib.format.open_memmap(output_dir / f"{label}_{key}.npy",
+            mode="w+", dtype="float32", shape=(n_neuron, n_bin))
+    for key in ["split_half_raw", "split_half_smooth", "information"]:
+        result[key] = np.full(n_neuron, np.nan, dtype=np.float32)
+    # Include occupancy only from bins meeting the original sampling threshold.
+    masks = [(o > 0) & (o >= min_occupancy_seconds) for o in occupancy]
+    smoothed_occ = []
+    for occ, mask in zip(occupancy, masks):
+        grid = np.where(mask, occ, 0).reshape(bin_shape)
+        smoothed_occ.append(gaussian_filter(grid, smoothing_sigma_bins,
+            mode="wrap" if len(bin_shape) == 1 else "constant").ravel())
+    for start in tqdm(range(0, n_neuron, chunk_size), desc=f"Tuning Curve [{label}]"):
+        stop = min(start + chunk_size, n_neuron)
+        block = np.asarray(dff[start:stop, frame_idx], dtype=np.float32)
+        valid = valid_roi[start:stop]
+        block[~valid] = 0
+        raw, smooth = [], []
+        for design, occ, mask, smooth_occ in zip(designs, occupancy, masks, smoothed_occ):
+            sums = np.asarray(design @ block.T).T
+            curve = np.full_like(sums, np.nan)
+            np.divide(sums, occ, out=curve, where=mask[None, :])
+            numerator = np.where(mask, sums, 0).reshape((stop-start, *bin_shape))
+            sigma = (0, *([smoothing_sigma_bins] * len(bin_shape)))
+            numerator = gaussian_filter(numerator, sigma,
+                mode="wrap" if len(bin_shape) == 1 else "constant").reshape(sums.shape)
+            smoothed = np.full_like(sums, np.nan)
+            np.divide(numerator, smooth_occ, out=smoothed,
+                      where=mask[None, :] & (smooth_occ[None, :] > 0))
+            curve[~valid] = np.nan
+            smoothed[~valid] = np.nan
+            raw.append(curve)
+            smooth.append(smoothed)
+        np.maximum(block, 0, out=block)
+        positive_sums = np.asarray(designs[0] @ block.T).T
+        positive_map = np.full_like(positive_sums, np.nan)
+        np.divide(positive_sums, occupancy[0], out=positive_map, where=masks[0][None, :])
+        positive_map[~valid] = np.nan
+        result["tuning_raw"][start:stop] = raw[0]
+        result["tuning_smooth"][start:stop] = smooth[0]
+        result["positive_tuning_raw"][start:stop] = positive_map
+        r_raw, info = tuning_metrics(raw[1], raw[2], positive_map, occupancy[0])
+        r_smooth, _ = tuning_metrics(smooth[1], smooth[2], positive_map, occupancy[0])
+        result["split_half_raw"][start:stop] = r_raw
+        result["split_half_smooth"][start:stop] = r_smooth
+        result["information"][start:stop] = info
+        if save_half_maps:
+            for key, array in zip(keys[3:], [raw[1], raw[2], smooth[1], smooth[2]]):
+                result[key][start:stop] = array
+    for key in keys:
+        result[key].flush()
+    return result
+
+
+def shuffle_test(trace, *, n_shuffles=1000, min_shift_seconds=20.0,
+                 seed=42, chunk_size=256, save_null=False):
+    """Add circular-shift tests for position and HD information to trace.
+
+    Parameters
+    ----------
+    trace : dict
+        Output of process_openfield, including continuous post-5-second dFF,
+        timestamps, analysis indices, occupancy, and observed information.
+        This function updates the dictionary in place; the caller saves it.
+    n_shuffles : int, optional
+        Requested number of unique offsets, default 1000. If fewer offsets
+        exist, use all eligible offsets and report the actual count.
+    min_shift_seconds : float, optional
+        Exclude offsets closer than this to zero in either circular direction.
+        Default 20 s is illustrative; choose beyond relevant autocorrelation.
+    seed : int, optional
+        NumPy random generator seed. The same offsets are used for all cells
+        and both coding types, preserving population synchrony per surrogate.
+    chunk_size : int, optional
+        Neurons per block. Null scores occupy O(chunk_size * n_shuffles) RAM;
+        work scales with neurons * shuffles * selected frames.
+    save_null : bool, optional
+        Retain neuron-by-shuffle arrays as disk-backed files and in trace.
+        False stores summary statistics and offsets only.
+
+    Returns
+    -------
+    trace : dict
+        Each position/hd dictionary gains shuffle_threshold95, shuffle_p,
+        above_shuffle_95, significant_uncorrected, shuffle_q, significant_fdr,
+        and shuffle_tested. Optional shuffle_information stores null scores.
+        Untestable neurons have NaN statistics and False flags. The top-level
+        shuffle dictionary records offsets, seed, count, and time boundaries.
+
+    Notes
+    -----
+    Shift the complete continuous neural trace within behavioral coverage,
+    THEN apply the original speed/position/heading selections. Shifting an
+    already speed-filtered trace would join nonadjacent times. Occupancy,
+    eligible bins, rectification, and the unsmoothed statistic stay fixed.
+    Regular imaging timestamps are required (1% interval tolerance).
+
+    One-sided p = (1 + count(null >= observed)) / (1 + n_shuffles); ties count
+    against significance. The strict observed > 95th-percentile flag and
+    p <= .05 are saved separately because finite samples/ties can differ.
+    Benjamini-Hochberg correction pools all tested position and HD hypotheses.
+    These tests assume approximate temporal stationarity and do not isolate
+    position/HD effects from correlated variables such as speed.
+    """
+    if (not isinstance(n_shuffles, (int, np.integer)) or n_shuffles < 1 or
+            not isinstance(chunk_size, (int, np.integer)) or chunk_size < 1 or
+            not np.isfinite(min_shift_seconds) or min_shift_seconds <= 0):
+        raise ValueError("Use positive shuffle count, chunk size, and minimum shift.")
+    covered = np.flatnonzero(trace["alignment_valid"])
+    if len(covered) < 2:
+        raise ValueError("Too few aligned frames for a circular-shift test.")
+    first, stop = int(covered[0]), int(covered[-1])+1
+    intervals = np.diff(trace["frame_time"][first:stop])
+    dt = float(np.median(intervals))
+    if dt <= 0 or not np.allclose(intervals, dt, rtol=.01, atol=1e-8):
+        raise ValueError("Shuffle needs regularly sampled imaging; resolve dropped frames first.")
+    n_time = stop-first
+    min_shift = max(1, int(np.ceil(min_shift_seconds/dt)))
+    allowed = np.arange(min_shift, n_time-min_shift+1, dtype=np.int64)
+    if not allowed.size:
+        raise ValueError("Recording is too short for min_shift_seconds in both directions.")
+    actual = min(n_shuffles, len(allowed))
     rng = np.random.default_rng(seed)
-    allowed = np.arange(min_shift, n_time - min_shift + 1, dtype=np.int64)
-    shifts = rng.choice(allowed, size=n_shuffles, replace=True)
-    np.save(shifts_path, shifts)
+    shifts = rng.choice(allowed, size=actual, replace=False)
+    if actual < n_shuffles:
+        print(f"Only {actual} unique eligible shifts; using all of them.", flush=True)
+    n_neuron = trace["dFF"].shape[0]
+    directory = Path(trace["suite2p_dir"])/"openfield_arrays"
+    if save_null:
+        directory.mkdir(exist_ok=True)
+    setups = []
+    for label, index_key, bin_key in [("position", "analysis_frame_idx", "spatial_bins"),
+                                      ("hd", "hd_frame_idx", "hd_bins")]:
+        result = trace[label]
+        occupancy = result["occupancy_seconds"][0]
+        eligible = (occupancy > 0) & (occupancy >= trace["parameters"]["min_occupancy_seconds"])
+        indices, bins = trace[index_key], trace[bin_key]
+        select = eligible[bins]
+        chosen = indices[select]
+        if np.any((chosen < first) | (chosen >= stop)):
+            raise ValueError("Analysis frames lie outside the shuffle interval.")
+        eligible_ids = np.flatnonzero(eligible)
+        rows = np.searchsorted(eligible_ids, bins[select])
+        design = sparse.csr_matrix((trace["frame_duration_seconds"][chosen],
+                                   (rows, np.arange(len(chosen)))),
+                                  shape=(len(eligible_ids), len(chosen)))
+        tested = trace["valid_roi"] & np.isfinite(result["information"])
+        # One occupied bin cannot establish selectivity across bins.
+        tested &= len(eligible_ids) >= 2
+        result["shuffle_tested"] = tested
+        for key in ["shuffle_threshold95", "shuffle_p", "shuffle_q"]:
+            result[key] = np.full(n_neuron, np.nan, dtype=np.float64)
+        for key in ["above_shuffle_95", "significant_uncorrected", "significant_fdr"]:
+            result[key] = np.zeros(n_neuron, dtype=bool)
+        result.pop("shuffle_information", None)
+        if save_null:
+            result["shuffle_information"] = np.lib.format.open_memmap(
+                directory/f"{label}_shuffle_information.npy", mode="w+",
+                dtype="float32", shape=(n_neuron, actual))
+        setups.append((label, chosen-first, design, occupancy[eligible], tested))
+    print(f"Circular shuffles: {actual} shifts, {n_neuron} neurons; p resolution {1/(actual+1):.6g}", flush=True)
+    shuffle_started = ttt.monotonic()
+    for start in range(0, n_neuron, chunk_size):
+        end = min(start+chunk_size, n_neuron)
+        print(f"Shuffle neurons {start}:{end}/{n_neuron}", flush=True)
+        block = np.maximum(np.asarray(trace["dFF"][start:end, first:stop]), 0)
+        block[~trace["valid_roi"][start:end]] = 0
+        null = [np.full((end-start, actual), np.nan, dtype=np.float32) for _ in setups]
+        last_update = ttt.monotonic()
+        for j, shift in enumerate(shifts):
+            for k, (_, indices, design, occupancy, tested) in enumerate(setups):
+                if not tested[start:end].any():
+                    continue
+                # Equivalent to np.roll(block, shift, axis=1)[:, indices].
+                samples = block[:, (indices-shift) % n_time]
+                response = np.asarray(design @ samples.T).T / occupancy
+                null[k][:, j] = information_score(response, occupancy, zero_value=0.0)
+            if ttt.monotonic()-last_update >= 5:
+                print(f"  Shifts {j+1}/{actual}", flush=True)
+                last_update = ttt.monotonic()
+        for scores, (label, _, _, _, tested) in zip(null, setups):
+            result = trace[label]
+            valid = tested[start:end]
+            scores[~valid] = np.nan
+            ids = np.flatnonzero(valid)+start
+            if len(ids):
+                result["shuffle_threshold95"][ids] = np.percentile(scores[valid], 95, axis=1)
+                result["shuffle_p"][ids] = (1 + np.sum(
+                    scores[valid] >= result["information"][ids, None], axis=1)) / (actual+1)
+            if save_null:
+                result["shuffle_information"][start:end] = scores
+        elapsed = ttt.monotonic()-shuffle_started
+        remaining = elapsed*(n_neuron-end)/end
+        print(f"  Elapsed {elapsed/60:.1f} min; estimated remaining {remaining/60:.1f} min", flush=True)
+    # Joint correction over all tested neuron x coding-type hypotheses.
+    pooled = np.concatenate([trace[label]["shuffle_p"] for label in ["position", "hd"]])
+    finite = np.flatnonzero(np.isfinite(pooled))
+    order = finite[np.argsort(pooled[finite])]
+    qvalues = np.full_like(pooled, np.nan)
+    adjusted = pooled[order]*len(order)/np.arange(1, len(order)+1)
+    qvalues[order] = np.minimum(1, np.minimum.accumulate(adjusted[::-1])[::-1])
+    for k, label in enumerate(["position", "hd"]):
+        result = trace[label]
+        result["shuffle_q"] = qvalues[k*n_neuron:(k+1)*n_neuron]
+        result["above_shuffle_95"] = result["shuffle_tested"] & (result["information"] > result["shuffle_threshold95"])
+        result["significant_uncorrected"] = result["shuffle_p"] <= .05
+        result["significant_fdr"] = result["shuffle_q"] <= .05
+        if save_null:
+            result["shuffle_information"].flush()
+            result["shuffle_information"] = np.asarray(result["shuffle_information"])
+        print(f"{label}: {result['above_shuffle_95'].sum()} above null 95th percentile; "
+              f"{result['significant_fdr'].sum()} pass joint BH q <= .05", flush=True)
+    trace["shuffle"] = dict(method="circular shift before behavioral filtering",
+        requested_n_shuffles=n_shuffles, n_shuffles=actual, seed=seed,
+        min_shift_seconds=min_shift_seconds, shift_frames=shifts,
+        shift_seconds=shifts*dt, first_frame=first, stop_frame=stop,
+        frame_interval_seconds=dt, unique_allowed_shifts=len(allowed),
+        minimum_p=1/(actual+1), fdr_family="all tested position and HD hypotheses",
+        statistic="unsmoothed information from framewise positive dF/F", save_null=save_null)
+    return trace
 
-    for start in tqdm(range(0, n_cells, cell_chunk_size), desc="Shuffle cell chunks"):
-        stop = min(start + cell_chunk_size, n_cells)
-        block = np.asarray(activity[start:stop], dtype=np.float32)
 
-        for s, shift in enumerate(shifts):
-            shifted = np.roll(block, int(shift), axis=1)
-            sums = np.asarray(design.T @ shifted.T, dtype=np.float32).T
-            maps = sums[:, valid_bins] / occ_flat[valid_bins][None, :]
-            ptp_null[start:stop, s] = np.nanmax(maps, axis=1) - np.nanmin(maps, axis=1)
+def plot_qc(trace, output_path):
+    """Save a compact diagnostic figure without plotting every neuron.
 
-            mean_response = np.sum(maps * p[None, :], axis=1)
-            ratio = np.divide(
-                maps,
-                mean_response[:, None],
-                out=np.zeros_like(maps),
-                where=mean_response[:, None] > 0,
-            )
-            term = np.zeros_like(ratio)
-            positive = ratio > 0
-            term[positive] = ratio[positive] * np.log2(ratio[positive])
-            si_null[start:stop, s] = np.sum(term * p[None, :], axis=1)
+    Parameters
+    ----------
+    trace : dict
+        Output from process_openfield.
+    output_path : str or pathlib.Path
+        Destination PNG file.
 
-        ptp_null.flush()
-        si_null.flush()
-
-    return {
-        "shuffle_ptp_path": str(ptp_path),
-        "shuffle_spatial_information_path": str(si_path),
-        "shuffle_offsets_path": str(shifts_path),
-        "n_shuffles": int(n_shuffles),
-        "min_shift_seconds": float(min_shift_seconds),
-        "shuffle_seed": int(seed),
-    }
-
-
-def _save_figure(fig: plt.Figure, stem: str | Path) -> None:
-    stem = Path(stem)
-    fig.savefig(stem.with_suffix(".png"), dpi=300, bbox_inches="tight")
-    fig.savefig(stem.with_suffix(".svg"), bbox_inches="tight")
+    Returns
+    -------
+    None
+        Saves occupancy, speed, information, and stability distributions.
+    """
+    import matplotlib.pyplot as plt
+    fig, axes = plt.subplots(2, 3, figsize=(13, 7))
+    ny, nx = trace["parameters"]["n_bins_y"], trace["parameters"]["n_bins_x"]
+    image = axes[0, 0].imshow(trace["position"]["occupancy_seconds"][0].reshape(ny, nx),
+                            origin="lower", extent=(35, 65, 35, 65))
+    axes[0, 0].set(title="Position occupancy", xlabel="x", ylabel="y")
+    fig.colorbar(image, ax=axes[0, 0], label="seconds")
+    centers = trace["hd_bin_centers"]
+    axes[0, 1].plot(centers, trace["hd"]["occupancy_seconds"][0])
+    axes[0, 1].set(title="HD occupancy", xlabel="heading (radians)", ylabel="seconds")
+    speed = trace["frame_speed"]
+    axes[0, 2].hist(speed[np.isfinite(speed)], bins=60)
+    axes[0, 2].axvline(trace["parameters"]["speed_threshold"], color="r")
+    axes[0, 2].set(title="Aligned speed", xlabel="task units / second")
+    for label in ["position", "hd"]:
+        values = trace[label]["information"]
+        axes[1, 0].hist(values[np.isfinite(values)], bins=60, alpha=.5, label=label)
+        values = trace[label]["split_half_smooth"]
+        axes[1, 1].hist(values[np.isfinite(values)], bins=60, alpha=.5, label=label)
+    axes[1, 0].set(title="Positive dF/F information", xlabel="Skaggs-form score")
+    axes[1, 1].set(title="Split-half stability", xlabel="Pearson r")
+    axes[1, 0].legend()
+    axes[1, 1].legend()
+    stride = max(1, len(trace["frame_time"]) // 10000)
+    axes[1, 2].plot(trace["frame_time"][::stride], trace["frame_speed"][::stride], lw=.5)
+    axes[1, 2].set(title="Speed over time", xlabel="seconds", ylabel="task units / second")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=180)
     plt.close(fig)
 
 
-def plot_processing_qc(trace: dict, figure_dir: str | Path) -> None:
-    figure_dir = Path(figure_dir)
-    figure_dir.mkdir(parents=True, exist_ok=True)
+def process_openfield(suite2p_dir, behav_file, *, speed_threshold=0.0,
+                      speed_window_samples=200, n_bins_x=30, n_bins_y=30,
+                      n_hd_bins=36, min_occupancy_seconds=1.0,
+                      smoothing_sigma_bins=1.0, neuropil_coeff=0.7,
+                      baseline_method="maximin", baseline_window_seconds=60.0,
+                      baseline_percentile=20.0, baseline_sigma_seconds=1.0,
+                      baseline_min=1e-6, chunk_size=256, frame_times=None,
+                      imaging_time_offset=0.0, max_alignment_gap_seconds=None,
+                      save_half_maps=False, make_plots=True, session_metadata=None,
+                      n_shuffles=0, min_shuffle_shift_seconds=20.0,
+                      shuffle_seed=42, save_shuffle_null=False):
+    """Process one recording and save trace.pkl beside the neural data.
 
-    fig, ax = plt.subplots(figsize=(5, 5))
-    ax.plot(trace["ms_pos_x"], trace["ms_pos_y"], linewidth=0.35)
-    ax.set_xlim(*trace["position_range"])
-    ax.set_ylim(*trace["position_range"])
-    ax.set_aspect("equal")
-    ax.set_xlabel("x position")
-    ax.set_ylabel("y position")
-    ax.set_title("Valid open-field trajectory")
-    _save_figure(fig, figure_dir / "trajectory_qc")
+    Parameters
+    ----------
+    suite2p_dir, behav_file : str or pathlib.Path
+        Paths passed unchanged to import_suite2p and import16chFlt. Importer
+        output requires RawTraces, Fneu, fs, and behav_time/pos_x/pos_y/orient.
+        All imported ROIs are retained; invalid baselines are flagged.
+    speed_threshold : float, optional
+        Keep frames with speed strictly greater than this task-unit/s value.
+        Default zero excludes stationary frames without assuming a physical
+        calibration or a biological locomotion cutoff.
+    speed_window_samples : int, optional
+        Centered behavior-sample boxcar length, default 200 (~33 ms at 6 kHz).
+    n_bins_x, n_bins_y, n_hd_bins : int, optional
+        Spatial bins across [35, 65] and HD bins across [0, 2*pi).
+    min_occupancy_seconds, smoothing_sigma_bins : float, optional
+        Per-bin sampled-time threshold and occupancy-normalized smoothing.
+    neuropil_coeff, baseline_method, baseline_window_seconds : optional
+        See compute_dff. Baseline uses all imaging frames at t >= 5, before
+        speed filtering. Default is a running maximin baseline.
+    baseline_percentile, baseline_sigma_seconds, baseline_min : float, optional
+        See compute_dff. Baseline parameters should be checked for sustained
+        activity, which a short running baseline may attenuate.
+    chunk_size : int, optional
+        Neuron block size for dF/F and sparse tuning aggregation.
+    frame_times : array_like, shape (n_frame,), optional
+        Measured timestamps in seconds on the behavior clock, shared by ROIs.
+        If omitted, use arange(n_frame)/fs + imaging_time_offset. For combined
+        planes with materially different clocks, analyze planes separately.
+    imaging_time_offset : float, optional
+        Offset in seconds for the regular imaging clock; not added to supplied
+        frame_times. An unverified offset is not automatic synchronization.
+    max_alignment_gap_seconds : float, optional
+        Maximum nearest-behavior distance. Default 2/6000 seconds. Frames
+        outside behavioral coverage or inside long behavioral gaps are dropped.
+    save_half_maps, make_plots : bool, optional
+        Save extra half tuning arrays and make a diagnostic PNG, respectively.
+    session_metadata : dict, optional
+        FishID/session or other small identifiers, stored under session_metadata.
+    n_shuffles : int, optional
+        Circular shifts for each information test. Zero disables this expensive
+        step; 1000 is a starting choice. See shuffle_test for assumptions.
+    min_shuffle_shift_seconds : float, optional
+        Minimum offset from zero in either circular direction, default 20 s.
+    shuffle_seed : int, optional
+        Seed for reproducible unique offsets.
+    save_shuffle_null : bool, optional
+        Also store neuron-by-shuffle null scores; default False saves summaries.
 
-    fig, ax = plt.subplots(figsize=(5, 4))
-    image = ax.imshow(trace["occupancy_seconds"], origin="lower", interpolation="nearest")
-    ax.set_xlabel("x bin")
-    ax.set_ylabel("y bin")
-    ax.set_title("Occupancy (s)")
-    fig.colorbar(image, ax=ax, label="seconds")
-    _save_figure(fig, figure_dir / "occupancy_map")
+    Returns
+    -------
+    trace : dict
+        Self-contained arrays and parameters. dFF includes all imaging frames
+        at t >= 5; analysis_frame_idx selects speed/position-valid frames.
+        HD additionally requires finite heading. Position/HD tuning arrays are
+        (n_neuron, n_bin). Occupancy arrays are (3, n_bin), ordered session,
+        first half, second half. Frame indices refer to retained dFF columns;
+        original_frame_idx maps those columns to imported neural frames.
 
-
-def plot_example_cells(
-    trace: dict,
-    figure_dir: str | Path,
-    n_examples: int = 20,
-) -> None:
-    """Plot cells ranked by split-half reliability; no spatial-cell cutoff is imposed."""
-    figure_dir = Path(figure_dir) / "example_cells"
-    figure_dir.mkdir(parents=True, exist_ok=True)
-    reliability = np.asarray(trace["split_half_correlation"])
-    order = np.argsort(np.nan_to_num(reliability, nan=-np.inf))[::-1][:n_examples]
-
-    for cell in order:
-        fig, axes = plt.subplots(1, 3, figsize=(11, 3.4))
-        titles = ["All", "First half", "Second half"]
-        maps = [trace["smooth_map_all"][cell], trace["smooth_map_first"][cell], trace["smooth_map_second"][cell]]
-        vmax = np.nanmax(maps[0])
-        for ax, title, rate_map in zip(axes, titles, maps):
-            image = ax.imshow(rate_map.reshape((N_BINS_X, N_BINS_Y)), origin="lower", interpolation="nearest", vmin=0, vmax=vmax)
-            ax.set_title(title)
-            ax.set_xlabel("x bin")
-            ax.set_ylabel("y bin")
-            fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
-        fig.suptitle(
-            f"ROI {cell} | split-half r={trace['split_half_correlation'][cell]:.3f} | "
-            f"SI={trace['spatial_information_smooth'][cell]:.3f}"
-        )
-        _save_figure(fig, figure_dir / f"roi_{cell:05d}")
-
-
-def run_OpenField2D(
-    i: int,
-    sheet_file: pd.DataFrame,
-    ds_behav_to: int = 50,
-    position_range: tuple[float, float] = POSITION_RANGE,
-    n_bins_x: int = N_BINS_X,
-    n_bins_y: int = N_BINS_Y,
-    min_occupancy_seconds: float = 0.2,
-    smoothing_sigma_bins: float = 0.5,
-    baseline_percentile: float = 20.0,
-    neuropil_coeff: float = 0.7,
-    run_shuffle: bool = False,
-    n_shuffles: int = 1000,
-    min_shuffle_shift_seconds: float = 10.0,
-    n_example_cells: int = 20,
-    n_direction_bins = 36
-) -> None:
-    """Process one continuous 2-D open-field recording."""
-    suite2p_dir = sheet_file.loc[i, "suite2p_dir"]
-    behav_file = sheet_file.loc[i, "behav_dir"]
-    save_dir = Path(os.path.dirname(behav_file))
-    figure_dir = save_dir / "process" / "figures"
-    shuffle_dir = save_dir / "process" / "shuffle"
-    figure_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"{i}, Fish ID: {sheet_file.loc[i, 'FishID']}, session: {sheet_file.loc[i, 'session']}")
-    print("1. Import Suite2p and behavioral data")
-    trace = import_suite2p(suite2p_dir)
-    res = import16chFlt(behav_file, nchannel=21)
-
-    paradigm_values = np.unique(res["Paradigm"])
-    if paradigm_values.size != 1 or int(paradigm_values[0]) != EXPECTED_PARADIGM:
-        raise ValueError(
-            f"Expected paradigm {EXPECTED_PARADIGM}, but found {paradigm_values.tolist()}. "
-            "This file should not be processed as the 2-D open-field assay."
-        )
-
-    trace.update(
-        {
-            "FishID": sheet_file.loc[i, "FishID"],
-            "session": sheet_file.loc[i, "session"],
-            "save_dir": str(save_dir),
-            "paradigm": int(paradigm_values[0]),
-            "position_range": tuple(map(float, position_range)),
-            "n_bins_x": int(n_bins_x),
-            "n_bins_y": int(n_bins_y),
-            "dff_method": {
-                "source": "F - neuropil_coeff * Fneu",
-                "neuropil_coeff": float(neuropil_coeff),
-                "baseline": f"per-ROI temporal {baseline_percentile}th percentile",
-                "rectified_nonnegative": True,
-            },
-        }
-    )
-    tiff.imwrite(save_dir / "mean_image.tif", trace["meanImg"])
-
-    print("2. Compute nonnegative dF/F")
-    trace["dFF"] = compute_nonnegative_dff(
-        trace["RawTraces"],
-        trace["Fneu"],
-        neuropil_coeff=neuropil_coeff,
+    Notes
+    -----
+    Occupancy is sampled at imaging times (not dense behavioral occupancy),
+    weighted by imaging-frame intervals capped at 1/fs (no gap bridging).
+    Half membership uses the temporal
+    midpoint of the overlapping recording before speed filtering. Circular
+    projection preserves direction: (dx,dy) *= min(1,15/hypot(dx,dy)).
+    """
+    if not isinstance(n_shuffles, (int, np.integer)) or n_shuffles < 0:
+        raise ValueError("n_shuffles must be a nonnegative integer.")
+    if (any(not isinstance(n, (int, np.integer)) or n < 1 for n in
+            [speed_window_samples, n_bins_x, n_bins_y, n_hd_bins, chunk_size]) or
+            not np.isfinite(speed_threshold) or speed_threshold < 0 or
+            not np.isfinite(min_occupancy_seconds) or min_occupancy_seconds < 0 or
+            not np.isfinite(smoothing_sigma_bins) or smoothing_sigma_bins < 0):
+        raise ValueError("Invalid bin, speed, chunk, occupancy, or smoothing parameters.")
+    save_dir = Path(suite2p_dir)
+    if not save_dir.is_dir():
+        raise ValueError("suite2p_dir must be an existing neural-data directory.")
+    output_dir = save_dir / "openfield_arrays"
+    output_dir.mkdir(exist_ok=True)
+    print(ttt.strftime("%Y-%m-%d %H:%M:%S", ttt.localtime()))
+    print("Importing neural and 28-channel behavioral data", flush=True)
+    neural = import_suite2p(suite2p_dir)
+    res = import16chFlt(behav_file, nchannel=28)
+    raw_f, fneu = neural["RawTraces"], neural["Fneu"]
+    fs = float(neural["fs"])
+    if not np.isfinite(fs) or fs <= 0 or raw_f.ndim != 2 or raw_f.shape != fneu.shape:
+        raise ValueError("Require matching 2-D RawTraces/Fneu and positive per-plane fs.")
+    time = np.asarray(res["behav_time"], dtype=np.float64)
+    if time.ndim != 1 or len(time) < 2 or not np.isfinite(time).all() or np.any(np.diff(time) <= 0):
+        raise ValueError("Behavior timestamps must be finite and strictly increasing seconds.")
+    first = np.searchsorted(time, 5.0)
+    if len(time)-first < 2:
+        raise ValueError("Too few behavioral samples at t >= 5 seconds.")
+    bt = time[first:]
+    
+    position = []
+    for key in ["behav_pos_x", "behav_pos_y", "behav_orient"]:
+        array = np.asarray(res[key])
+        if array.shape != time.shape:
+            raise ValueError(f"{key} must match behav_time.")
+        position.append(array[first:].astype(np.float64))
+    x, y, heading = position
+    valid_position = np.isfinite(x) & np.isfinite(y) & (x >= 0) & (x < 100) & (y >= 0) & (y < 100)
+    dx, dy = x-50, y-50
+    radius = np.hypot(dx, dy)
+    scale = np.ones_like(radius)
+    np.divide(15.0, radius, out=scale, where=radius > 15)
+    x, y = 50+dx*scale, 50+dy*scale
+    x[~valid_position] = np.nan
+    y[~valid_position] = np.nan
+    dt = np.diff(bt)
+    dl = np.hypot(np.diff(x), np.diff(y))
+    # A boxcar mean ratio equals the requested sum(dl)/sum(dt), in O(T) time.
+    # Constant padding reproduces convolution edges; invalid intervals exclude
+    # every speed window that touches them, rather than bridging missing data.
+    interval_ok = np.isfinite(dl) & (dt <= 2/6000)
+    win = speed_window_samples
+    sum_dl = uniform_filter1d(np.where(interval_ok, dl, 0), win, mode="constant")
+    sum_dt = uniform_filter1d(dt, win, mode="constant")
+    bad = uniform_filter1d((~interval_ok).astype(float), win, mode="constant")
+    interval_speed = np.full_like(dl, np.nan)
+    np.divide(sum_dl, sum_dt, out=interval_speed, where=(sum_dt > 0) & (bad < 1e-12))
+    speed = np.r_[interval_speed[0], interval_speed]
+    ft = (np.arange(raw_f.shape[1], dtype=float)/fs + imaging_time_offset
+          if frame_times is None else np.asarray(frame_times, dtype=float))
+    if (ft.shape != (raw_f.shape[1],) or not np.isfinite(ft).all() or
+            len(ft) < 2 or np.any(np.diff(ft) <= 0)):
+        raise ValueError("Frame times must match neural columns and increase strictly.")
+    # Frame weights come from the original clock, never from speed-filtered gaps.
+    # Missing imaging frames must not assign the entire gap to one position.
+    frame_duration = np.minimum(np.r_[np.diff(ft), 1/fs], 1/fs)
+    start_frame = int(np.searchsorted(ft, 5.0))
+    if len(ft)-start_frame < 2:
+        raise ValueError("Too few imaging frames at t >= 5 seconds.")
+    original_idx = np.arange(start_frame, len(ft))
+    frame_duration = frame_duration[start_frame:]
+    ft = ft[start_frame:]
+    right = np.clip(np.searchsorted(bt, ft), 0, len(bt)-1)
+    left = np.maximum(right-1, 0)
+    idx = np.where(np.abs(bt[left]-ft) <= np.abs(bt[right]-ft), left, right)
+    gap_limit = 2/6000 if max_alignment_gap_seconds is None else max_alignment_gap_seconds
+    if not np.isfinite(gap_limit) or gap_limit <= 0:
+        raise ValueError("max_alignment_gap_seconds must be positive.")
+    aligned = (ft >= bt[0]) & (ft <= bt[-1]) & (np.abs(bt[idx]-ft) <= gap_limit)
+    frame_xy = np.column_stack([x[idx], y[idx]]).astype(np.float32)
+    print(frame_xy.shape)
+    frame_heading = np.mod(heading[idx], 2*np.pi).astype(np.float64)
+    frame_speed = speed[idx].astype(np.float32)
+    frame_xy[~aligned] = np.nan
+    frame_heading[~aligned] = np.nan
+    frame_speed[~aligned] = np.nan
+    analysis_mask = aligned & np.isfinite(frame_xy).all(axis=1) & (frame_speed > speed_threshold)
+    analysis_idx = np.flatnonzero(analysis_mask)
+    if len(analysis_idx) < 2:
+        raise ValueError("Fewer than two imaging frames survive alignment/position/speed filtering.")
+    midpoint = (max(5.0, bt[0], ft[0]) + min(bt[-1], ft[-1]))/2
+    first_half = ft < midpoint
+    xy_bins = np.floor((frame_xy[analysis_idx]-35)/30 * [n_bins_x, n_bins_y]).astype(np.int32)
+    xy_bins = np.clip(xy_bins, 0, [n_bins_x-1, n_bins_y-1])
+    spatial_bins = xy_bins[:, 1]*n_bins_x + xy_bins[:, 0]
+    hd_idx = analysis_idx[np.isfinite(frame_heading[analysis_idx])]
+    hd_bins = np.floor(frame_heading[hd_idx]/(2*np.pi)*n_hd_bins).astype(np.int32)
+    hd_bins = np.clip(hd_bins, 0, n_hd_bins-1)
+    print(f"Retained {len(analysis_idx)}/{len(ft)} position frames; {len(hd_idx)} HD frames", flush=True)
+    
+    parameters = dict(
+        speed_threshold=speed_threshold, 
+        speed_window_samples=win,
+        behavioral_fs=6000, 
+        discard_before_seconds=5.0, 
+        circle_center=(50,50), 
+        circle_radius=15,
+        n_bins_x=n_bins_x, 
+        n_bins_y=n_bins_y, 
+        n_hd_bins=n_hd_bins,
+        min_occupancy_seconds=min_occupancy_seconds, 
+        smoothing_sigma_bins=smoothing_sigma_bins,
+        neuropil_coeff=neuropil_coeff, 
+        baseline_method=baseline_method,
+        baseline_window_seconds=baseline_window_seconds, 
         baseline_percentile=baseline_percentile,
+        baseline_sigma_seconds=baseline_sigma_seconds, 
+        baseline_min=baseline_min,
+        chunk_size=chunk_size, 
+        imaging_time_offset=imaging_time_offset,
+        measured_frame_times=frame_times is not None, 
+        max_alignment_gap_seconds=gap_limit,
+        save_half_maps=save_half_maps, 
+        information_signal="framewise max(signed dF/F, 0)",
+        spatial_bin_order="y * n_bins_x + x", 
+        occupancy_order=("session","first","second"),
     )
-    # Preserve Suite2p deconvolution as imported, but do not use it for dF/F.
-    trace["DeconvSignal"] = np.maximum(trace["DeconvSignal"], 0).astype(np.float32)
-    _save_trace(trace, save_dir, "nonnegative_dff")
-
-    print("3. Downsample behavior and retain only x/y in [35, 65]")
-    if 6000 % ds_behav_to != 0:
-        raise ValueError("ds_behav_to must divide the 6000-Hz behavioral sampling rate exactly.")
-    downsample_factor = 6000 // ds_behav_to
-    for key in list(res.keys()):
-        res[key] = res[key][::downsample_factor]
-
-    behav_time_ms = (res["behav_time"] * 1000).astype(np.int64)
-
-    # First align every imaging frame to the full behavioral stream. Only then
-    # remove frames outside the open field; otherwise excluded intervals would
-    # be assigned to the nearest valid position.
-    ms_time_full = np.arange(trace["dFF"].shape[1], dtype=np.float64) / float(trace["fs"]) * 1000.0
-    ms_time_full = ms_time_full.astype(np.int64)
-    coord_idx_full = coordinate_recording_time(ms_time_full, behav_time_ms)
-    aligned_x_full = res["behav_pos_x"][coord_idx_full]
-    aligned_y_full = res["behav_pos_y"][coord_idx_full]
-    aligned_orient_full = res["behav_orient"][coord_idx_full]
     
-    lo, hi = position_range
-    analysis_frame_idx = np.where(
-        np.isfinite(aligned_x_full)
-        & np.isfinite(aligned_y_full)
-        & (aligned_x_full >= lo)
-        & (aligned_x_full <= hi)
-        & (aligned_y_full >= lo)
-        & (aligned_y_full <= hi)
-    )[0]
-    if analysis_frame_idx.size == 0:
-        raise ValueError("No imaging frames align to positions inside the open field.")
-
-    _, analysis_nodes, analysis_xy_bins = positions_to_nodes(
-        aligned_x_full[analysis_frame_idx],
-        aligned_y_full[analysis_frame_idx],
-        position_range=position_range,
-        n_bins_x=n_bins_x,
-        n_bins_y=n_bins_y,
-    )
-    analysis_activity = trace["dFF"][:, analysis_frame_idx]
-
-    trace["analysis_frame_idx"] = analysis_frame_idx.astype(np.int64)
-    trace["ms_time"] = ms_time_full[analysis_frame_idx]
-    trace["ms_pos_x"] = aligned_x_full[analysis_frame_idx].astype(np.float32)
-    trace["ms_pos_y"] = aligned_y_full[analysis_frame_idx].astype(np.float32)
-    trace["ms_orient"] = ms_orient = aligned_orient_full[analysis_frame_idx]
-    trace['ms_map'] = res["map"][coord_idx_full][analysis_frame_idx]
-    trace['behav_to_ms_idx'] = coord_idx_full[analysis_frame_idx]
-    trace["spike_nodes"] = analysis_nodes.astype(np.int32)
-    trace["ms_xy_bins"] = analysis_xy_bins
-    trace["n_neuron"] = int(trace["dFF"].shape[0])
-
-    print("4. Compute 30 x 30 tuning maps and save immediately")
-    min_occ_samples = max(1, int(np.ceil(min_occupancy_seconds * trace["fs"])))
-    rate_map_all, occupancy_samples = compute_2d_response_map(
-        analysis_activity,
-        trace["spike_nodes"],
-        n_bins_x=n_bins_x,
-        n_bins_y=n_bins_y,
-        min_occupancy_samples=min_occ_samples,
-    )
-    trace["rate_map_all"] = rate_map_all
-    trace["occupancy_samples"] = occupancy_samples
-    trace["occupancy_seconds"] = occupancy_samples.astype(np.float32) / float(trace["fs"])
-    trace["min_occupancy_seconds"] = float(min_occupancy_seconds)
-    trace["smooth_map_all"] = smooth_2d_maps(rate_map_all, sigma_bins=smoothing_sigma_bins)
-
-    midpoint = analysis_activity.shape[1] // 2
-    first_map, first_occ = compute_2d_response_map(
-        analysis_activity[:, :midpoint], trace["spike_nodes"][:midpoint], n_bins_x, n_bins_y, min_occ_samples
-    )
-    second_map, second_occ = compute_2d_response_map(
-        analysis_activity[:, midpoint:], trace["spike_nodes"][midpoint:], n_bins_x, n_bins_y, min_occ_samples
-    )
-    trace["rate_map_first"] = first_map
-    trace["rate_map_second"] = second_map
-    trace["occupancy_first_samples"] = first_occ
-    trace["occupancy_second_samples"] = second_occ
-    trace["smooth_map_first"] = smooth_2d_maps(first_map, sigma_bins=smoothing_sigma_bins)
-    trace["smooth_map_second"] = smooth_2d_maps(second_map, sigma_bins=smoothing_sigma_bins)
-    _save_trace(trace, save_dir, "tuning_maps_complete")
-
-    print("5. Compute spatial metrics and save")
-    trace["split_half_correlation"] = split_half_correlation(
-        trace["smooth_map_first"], trace["smooth_map_second"]
-    )
-    trace["spatial_information_raw"] = spatial_information(
-        trace["rate_map_all"], trace["occupancy_samples"]
-    )
-    trace["spatial_information_smooth"] = spatial_information(
-        trace["smooth_map_all"], trace["occupancy_samples"]
-    )
-    flat_map = trace["rate_map_all"].reshape(trace["n_neuron"], -1)
-    trace["peak_response"] = np.nanmax(flat_map, axis=1).astype(np.float32)
-    trace["ptp_response"] = (np.nanmax(flat_map, axis=1) - np.nanmin(flat_map, axis=1)).astype(np.float32)
-    trace["preferred_bin"] = np.nanargmax(np.nan_to_num(flat_map, nan=-np.inf), axis=1).astype(np.int32)
-    trace["preferred_y_bin"] = (trace["preferred_bin"] // n_bins_x).astype(np.int16)
-    trace["preferred_x_bin"] = (trace["preferred_bin"] % n_bins_x).astype(np.int16)
-    _save_trace(trace, save_dir, "spatial_metrics_complete")
-
-    print("6. Save QC figures as PNG and SVG")
-    plot_processing_qc(trace, figure_dir)
-    plot_example_cells(trace, figure_dir, n_examples=n_example_cells)
-    trace["figure_dir"] = str(figure_dir)
-    _save_trace(trace, save_dir, "figures_complete")
-
-    if run_shuffle:
-        print("7. Compute temporal-shuffle null distributions")
-        shuffle_metadata = compute_temporal_shuffle_distributions(
-            analysis_activity,
-            trace["spike_nodes"],
-            trace["occupancy_samples"],
-            output_dir=shuffle_dir,
-            n_shuffles=n_shuffles,
-            min_shift_seconds=min_shuffle_shift_seconds,
-            fs=float(trace["fs"]),
-        )
-        trace.update(shuffle_metadata)
-
-        # Calculate post-hoc-ready empirical p-values while retaining all raw null values.
-        ptp_null = np.load(trace["shuffle_ptp_path"], mmap_mode="r")
-        si_null = np.load(trace["shuffle_spatial_information_path"], mmap_mode="r")
-        trace["ptp_shuffle_p"] = (
-            (np.sum(ptp_null >= trace["ptp_response"][:, None], axis=1) + 1) / (n_shuffles + 1)
-        ).astype(np.float32)
-        trace["spatial_information_shuffle_p"] = (
-            (np.sum(si_null >= trace["spatial_information_raw"][:, None], axis=1) + 1) / (n_shuffles + 1)
-        ).astype(np.float32)
-        trace["ptp_shuffle_95"] = np.percentile(ptp_null, 95, axis=1).astype(np.float32)
-        trace["spatial_information_shuffle_95"] = np.percentile(si_null, 95, axis=1).astype(np.float32)
-        _save_trace(trace, save_dir, "shuffle_complete")
-
-    print(f"Done: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    neural_data = {
+        'roi_coord': neural['roi_coord'].copy(),
+        'snr': neural['snr'].copy(),
+        'suite2p_version': neural['suite2p_version'],
+        'nplanes': neural['nplanes'],
+        'nchannels': neural['nchannels'],
+        'tau': neural['tau'],
+        'fs': neural['fs'],
+        'pretrained_model': neural['pretrained_model'],
+        'lenX': neural['lenX'],
+        'lenY': neural['lenY'],
+        'lenZ': neural['lenZ'],
+        'meanImg': neural['meanImg'].copy(),
+        'nframes': neural['nframes']
+    }
+    # Release high-rate imports and unused neural arrays before large computations.
+    metadata = {key: neural[key] for key in ["stat", "iscell"] if key in neural}
+    del res, neural, time, bt, position, x, y, heading, dx, dy, radius, scale, dt, dl
+    del sum_dl, sum_dt, bad, interval_speed, speed, interval_ok, valid_position
+    dff, valid_roi, baseline_summary = compute_dff(raw_f, fneu, fs, output_dir/"dff.npy",
+        start_frame=start_frame, neuropil_coeff=neuropil_coeff, baseline_method=baseline_method,
+        baseline_window_seconds=baseline_window_seconds, baseline_percentile=baseline_percentile,
+        baseline_sigma_seconds=baseline_sigma_seconds, baseline_min=baseline_min, chunk_size=chunk_size)
+    del raw_f, fneu
     
-    # Head-direction analysis
-    theta = np.mod(ms_orient, 2 * np.pi)
-
-    direction_bin = np.floor(
-        theta / (2 * np.pi) * n_direction_bins
-    ).astype(np.int32)
-
-    direction_bin = np.clip(
-        direction_bin,
-        0,
-        n_direction_bins - 1,
+    print(f"Valid fluorescence baselines: {valid_roi.sum()}/{len(valid_roi)} ROIs", flush=True)
+    trace = dict(
+        schema_version=3, 
+        suite2p_dir=str(suite2p_dir), 
+        behav_file=str(behav_file),
+        n_neuron=dff.shape[0], 
+        parameters=parameters, 
+        dFF=np.asarray(dff),
+        valid_roi=valid_roi, 
+        baseline_summary=baseline_summary, 
+        frame_time=ft,
+        session_metadata=dict(session_metadata or {}),
+        original_frame_idx=original_idx, 
+        frame_duration_seconds=frame_duration,
+        frame_xy=frame_xy, 
+        frame_heading=frame_heading, 
+        frame_speed=frame_speed,
+        alignment_valid=aligned, 
+        behavior_sample_idx=idx+first, 
+        analysis_mask=analysis_mask,
+        analysis_frame_idx=analysis_idx, 
+        spatial_bins=spatial_bins, 
+        hd_frame_idx=hd_idx,
+        hd_bins=hd_bins, 
+        split_midpoint_seconds=midpoint,
+        position_x_edges=np.linspace(35,65,n_bins_x+1),
+        position_y_edges=np.linspace(35,65,n_bins_y+1),
+        hd_bin_centers=(np.arange(n_hd_bins)+.5)*2*np.pi/n_hd_bins, 
+        **metadata, 
+        **neural_data
     )
-    n_neuron = trace["n_neuron"]
-    direction_map = np.zeros((n_neuron, n_direction_bins))
-    for j in tqdm(range(n_direction_bins)):
-        binidx = direction_bin == j
-        direction_map[:, j] = np.nanmean(
-            trace["dFF"][:, binidx], axis=1
+    
+    for label, indices, bins, shape in [("position", analysis_idx, spatial_bins, (n_bins_y,n_bins_x)),
+                                      ("hd", hd_idx, hd_bins, (n_hd_bins,))]:
+        result = compute_tuning(
+            dff, 
+            indices, 
+            bins, 
+            frame_duration[indices], 
+            first_half[indices],
+            valid_roi, 
+            shape, 
+            output_dir, 
+            label, 
+            chunk_size=chunk_size,
+            min_occupancy_seconds=min_occupancy_seconds, 
+            smoothing_sigma_bins=smoothing_sigma_bins,
+            save_half_maps=save_half_maps
         )
-    trace["direction_map_raw"] = direction_map
-    trace["direction_map_smooth"] = smooth_2d_maps(direction_map, sigma_bins=smoothing_sigma_bins)
-    _save_trace(trace, save_dir, "direction_maps_complete")
+        # ndarray views keep disk-backed storage while making the pickle portable.
+        trace[label] = {key: np.asarray(value) for key, value in result.items()}
+        
+    if n_shuffles:
+        shuffle_test(trace, n_shuffles=n_shuffles, min_shift_seconds=min_shuffle_shift_seconds,
+                     seed=shuffle_seed, chunk_size=chunk_size, save_null=save_shuffle_null)
+        
+    if make_plots:
+        plot_qc(trace, save_dir/"openfield_qc.png")
+        
+    print("Saving self-contained trace.pkl (large recordings may take several minutes)", flush=True)
+    path = save_dir/"trace.pkl"
+    tmp = path.with_suffix(".pkl.tmp")
+    with open(tmp, "wb") as stream:
+        pickle.dump(trace, stream, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp, path)
+    print(f"Done: {path}", flush=True)
+    print(ttt.strftime("%Y-%m-%d %H:%M:%S", ttt.localtime()))
+    return trace
+
+
+def run_OpenField2D(i, sheet_file, **kwargs):
+    """Process a spreadsheet row using the original calling interface.
+
+    Parameters
+    ----------
+    i : int or hashable
+        DataFrame row label.
+    sheet_file : pandas.DataFrame
+        Must contain suite2p_dir and behav_dir; FishID/session are optional.
+    **kwargs
+        Keyword arguments forwarded to process_openfield.
+
+    Returns
+    -------
+    trace : dict
+        Saved analysis dictionary, including available FishID/session values.
+    """
+    row = sheet_file.loc[i]
+    print(f"Row {i}: FishID={row.get('FishID', 'unknown')}, session={row.get('session', 'unknown')}")
+    metadata = dict(kwargs.pop("session_metadata", {}) or {})
+    metadata.update({key: row[key] for key in ["FishID", "session"] if key in row})
+    return process_openfield(row["suite2p_dir"], row["behav_dir"],
+                             session_metadata=metadata, **kwargs)
 
 
 if __name__ == "__main__":
-    info = {
-        "FishID": ["10220"],
-        "session": [2],
-        "suite2p_dir": [r"D:\EnData\Light-sheet\10220\snr filtered"],
-        "behav_dir": [r"D:\EnData\Light-sheet\10220\S2\res.16chFlt"],
-    }
-    sheet_file = pd.DataFrame(info)
-    for session_idx in range(len(sheet_file)):
-        run_OpenField2D(
-            session_idx,
-            sheet_file,
-            run_shuffle=True,  # Run tuning maps first; enable later for costly null tests.
-            n_shuffles=1000,
-        )
+    trace = process_openfield(
+        suite2p_dir=r"D:\EnData\Light-sheet\open field\10258\S4-OF-Post\snr filtered",
+        behav_file=r"D:\EnData\Light-sheet\open field\10258\S4-OF-Post\res.16chFlt",
+        speed_threshold=0.0,
+        speed_window_samples=200,
+        chunk_size=1024,
+        baseline_method="maximin",
+        baseline_window_seconds=60.0,        
+        n_shuffles=1000,
+        min_shuffle_shift_seconds=20.0,
+        shuffle_seed=42,
+        save_shuffle_null=False,
+    )

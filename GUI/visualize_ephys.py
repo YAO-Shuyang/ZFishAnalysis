@@ -200,10 +200,11 @@ class SimpleViewer(QWidget):
         elif ext == ".16chflt":
             from zfish._io import import16chFlt
             try:
-                data = import16chFlt(path)
+                data = import16chFlt(path, nchannel=28)
             except:
                 try: 
-                    data = import16chFlt(path, nchannel=16)
+                    for nchannel in [25, 21, 16]:
+                        data = import16chFlt(path, nchannel=nchannel)
                 except:
                     pass
         else:
